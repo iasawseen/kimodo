@@ -214,8 +214,8 @@ ref  = np.load("outputs/go_forward.npz")                       # the gait to lea
 pj   = torch.tensor(ref["posed_joints"],  dtype=torch.float32, device=device)   # [T,34,3]
 grot = torch.tensor(ref["global_rot_mats"], dtype=torch.float32, device=device) # [T,34,3,3] (required, unused)
 UPPER = list(range(15, 34))                                    # waist + both arms
-th = np.radians(30); c, s = np.cos(th), np.sin(th)
-Rx = torch.tensor([[1,0,0],[0,c,-s],[0,s,c]], dtype=torch.float32, device=device)  # forward pitch about X
+th = np.radians(30); c, s = np.cos(th), np.sin(th)             # +deg forward lean, -deg backward lean
+Rx = torch.tensor([[1,0,0],[0,c,-s],[0,s,c]], dtype=torch.float32, device=device)  # pitch about lateral X
 pivot  = pj[:, 0:1]                                             # pelvis
 leaned = pj.clone()
 leaned[:, UPPER] = pivot + torch.einsum("ij,tkj->tki", Rx, pj[:, UPPER] - pivot)
@@ -226,17 +226,27 @@ out  = model(["go forward"], [num_frames], constraint_lst=cons, num_denoising_st
              cfg_type="separated", cfg_weight=[2.0,2.0], return_numpy=True)
 ```
 
-Measured torso pitch (pelvis→`[waist_pitch, shoulders]` vector, sagittal plane) over a 4° upright baseline:
+Measured torso pitch (pelvis→`[waist_pitch, shoulders]` vector, sagittal plane) over a 4° upright baseline.
+**θ > 0 leans forward, θ < 0 leans backward**, and the two directions track symmetrically — the model
+relaxes toward upright by the same amount either way (~1.5° / 3.5° / 7° at 15 / 30 / 45°), giving a usable
+range of about **−34° to +42°** torso pitch:
 
-| target lean | achieved | note |
+| target θ | achieved | note |
 |--:|--:|---|
-| 15° | 17.6° | tracks well |
-| 30° | 30.6° | near-exact |
-| 45° | 41.8° | ~3° undershoot — model relaxes between keyframes, resists the extreme |
+| −45° | −33.9° | ~7° relax — resists the extreme |
+| −30° | −22.2° | tracks well |
+| −15° | −9.3° | tracks well |
+| +15° | +17.6° | tracks well |
+| +30° | +30.6° | near-exact |
+| +45° | +41.8° | ~7° relax — resists the extreme |
 
-Walk speed is unchanged (~1.08 m/s) — the lean rides on top of the reference gait.
+Walk speed is unchanged (~1.07 m/s) in either direction — the lean rides on top of the reference gait.
 
 Caveats:
+- **Kinematic only — no balance check.** Kimodo has no physics/CoM model, so it will happily produce a
+  pose (e.g. leaning back 34° while walking forward) that shifts the CoM off the support polygon. The
+  qpos retarget doesn't enforce stability either — whether such a pose is trackable on hardware is a
+  separate question for the downstream controller.
 - **Rigid "bow from the hips"** — the whole upper body pitches about the pelvis. For a specific spine
   *curvature* (bend only at `waist_pitch` vs. lean the whole torso), change the pivot / joint subset you
   rotate. Other axes reuse the same trick: rotate about Z for a **lateral lean**, about Y for a **twist**.
