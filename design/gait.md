@@ -17,6 +17,7 @@ Everything here is empirical — measured from generated trajectories, not from 
 | Relative speed ("slowly", "very slowly") | **prompt** | coarse, **floored at ~0.4 m/s** | saturates; can't go slower |
 | Exact **forward speed** (any value) | **Root2D path constraint** | exact on Kimodo root; **calibrate for G1 root** | no floor; down to ≤0.05 m/s |
 | Exact **step length** | **foot end-effector constraint** | ~1 cm (steady state), 10–40 cm | pins footfall positions |
+| **Torso lean / forward incline** | **FullBodyConstraintSet** (positions) | ~2–3° up to 30° | pitch upper body forward; pins whole body |
 | Exact **path / turn radius / waypoints** | **Root2D path constraint** | exact | (x,z) ground trajectory |
 | A specific speed *and* step length independently | **Root2D + foot constraints** together | — | decouple via footfall timing |
 | A number like "0.1 m/s", "40 cm steps" in the **prompt** | ❌ **ignored** | — | model reads meaning, not units → use constraints |
@@ -190,7 +191,64 @@ Caveats:
 
 ---
 
-## 4. How speed, cadence, and step length relate
+## 4. Torso lean / forward incline — `FullBodyConstraintSet`
+
+There is **no spine-angle constraint** and no way to constrain a single torso joint: `expand_joint_names`
+only knows the 5 end-effector groups (feet/hands/hips). The only lever that reaches the torso is
+`FullBodyConstraintSet`, which pins joint **positions** (its `update_constraints` explicitly drops the
+rotations — *"global rotations are not used here"*). So express a lean **geometrically**: put the
+upper-body joints forward of the pelvis.
+
+G1 joint groups: `0` pelvis · `1–14` legs · `15–17` waist (`yaw/roll/pitch`) · `18–25` left arm ·
+`26–33` right arm. **Upper body = 15–33.** The heading joints `[8,1]` are leg hips, so a torso lean
+leaves heading untouched.
+
+**Recipe:** pitch the upper-body joints forward about the pelvis by θ (rotation about the lateral X
+axis), then pin the leaned pose with `FullBodyConstraintSet` at keyframes:
+
+```python
+import numpy as np, torch
+from kimodo.constraints import FullBodyConstraintSet
+
+ref  = np.load("outputs/go_forward.npz")                       # the gait to lean (legs come from here)
+pj   = torch.tensor(ref["posed_joints"],  dtype=torch.float32, device=device)   # [T,34,3]
+grot = torch.tensor(ref["global_rot_mats"], dtype=torch.float32, device=device) # [T,34,3,3] (required, unused)
+UPPER = list(range(15, 34))                                    # waist + both arms
+th = np.radians(30); c, s = np.cos(th), np.sin(th)
+Rx = torch.tensor([[1,0,0],[0,c,-s],[0,s,c]], dtype=torch.float32, device=device)  # forward pitch about X
+pivot  = pj[:, 0:1]                                             # pelvis
+leaned = pj.clone()
+leaned[:, UPPER] = pivot + torch.einsum("ij,tkj->tki", Rx, pj[:, UPPER] - pivot)
+KF   = torch.arange(0, num_frames, 10, device=device)          # keyframe every 10 frames
+cons = [FullBodyConstraintSet(skel, KF, leaned[KF], grot[KF]).to(device)]
+out  = model(["go forward"], [num_frames], constraint_lst=cons, num_denoising_steps=100,
+             num_samples=1, multi_prompt=False, post_processing=False,
+             cfg_type="separated", cfg_weight=[2.0,2.0], return_numpy=True)
+```
+
+Measured torso pitch (pelvis→`[waist_pitch, shoulders]` vector, sagittal plane) over a 4° upright baseline:
+
+| target lean | achieved | note |
+|--:|--:|---|
+| 15° | 17.6° | tracks well |
+| 30° | 30.6° | near-exact |
+| 45° | 41.8° | ~3° undershoot — model relaxes between keyframes, resists the extreme |
+
+Walk speed is unchanged (~1.08 m/s) — the lean rides on top of the reference gait.
+
+Caveats:
+- **Rigid "bow from the hips"** — the whole upper body pitches about the pelvis. For a specific spine
+  *curvature* (bend only at `waist_pitch` vs. lean the whole torso), change the pivot / joint subset you
+  rotate. Other axes reuse the same trick: rotate about Z for a **lateral lean**, about Y for a **twist**.
+- **`FullBody` pins *all* joints**, so it also locks the legs to the reference walk you leaned. The lean
+  rides on that gait — to lean a slow / short-step walk, build `leaned` from *that* reference. There is
+  **no "torso-only, legs free"** path in the API (only the 5 EE groups or the full body).
+- Keyframe density trades faithfulness vs. freedom: every ~10 frames holds the lean tightly; sparser lets
+  the model relax toward its natural posture between keyframes.
+
+---
+
+## 5. How speed, cadence, and step length relate
 
 `speed = step_length × cadence`. The model **self-selects cadence ≈ 1 Hz** at slow constrained speeds.
 Consequences:
@@ -202,7 +260,7 @@ Consequences:
 
 ---
 
-## 5. Runtime setup & gotchas (read before running anything)
+## 6. Runtime setup & gotchas (read before running anything)
 
 **Environment** (see also the machine-specific run notes):
 - conda env `kimodo` (torch 2.12 cu13, transformers 5.1.0, mujoco, modelscope). Run from repo root with
@@ -229,12 +287,12 @@ Consequences:
 **Constraint construction quick-ref:**
 - `Root2DConstraintSet(skel, frame_indices[N], smooth_root_2d[N,2]=(x,z), global_root_heading=[N,2] | None)`
 - `LeftFootConstraintSet | RightFootConstraintSet(skel, frame_indices[N], global_joints_positions[N,34,3], global_joints_rots[N,34,3,3], smooth_root_2d[N,2])`
-- `FullBodyConstraintSet(skel, frame_indices, global_joints_positions, global_joints_rots, smooth_root_2d=None)` — pins *all* joint positions + root heading at keyframes (positions+heading only, not per-joint rotation).
+- `FullBodyConstraintSet(skel, frame_indices, global_joints_positions, global_joints_rots, smooth_root_2d=None)` — pins *all* joint positions + root heading at keyframes (positions+heading only, not per-joint rotation). Used for torso lean (§4).
 - Save/load JSON via `constraints.save_constraints_lst` / `load_constraints_lst(path, skel)`.
 
 ---
 
-## 6. Measurement recipes (for verifying your control)
+## 7. Measurement recipes (for verifying your control)
 
 ```python
 # forward speed (G1 / MuJoCo qpos): planar displacement / duration
@@ -254,11 +312,15 @@ aL, aR = skel.bone_index["left_ankle_roll_skel"], skel.bone_index["right_ankle_r
 # steady-state = mean of last 2 steps (first step from standstill overshoots)
 
 # cadence / step count: rising edges of (heel & toe) contact per foot, summed
+
+# torso lean / forward incline: pitch of pelvis->upper-torso vector in the sagittal (Y-Z) plane
+p = pj[:,0]; up = pj[:,[17,18,26]].mean(1)                    # pelvis -> waist_pitch + both shoulders
+pitch = np.degrees(np.arctan2((up-p)[:,2], (up-p)[:,1]))      # +Z forward vs +Y up; ~4° upright, +θ leaned
 ```
 
 ---
 
-## 7. Summary of the boundary (what text can and can't reach)
+## 8. Summary of the boundary (what text can and can't reach)
 
 | Property | Text prompt | Constraint |
 |---|---|---|
@@ -266,6 +328,7 @@ aL, aR = skel.bone_index["left_ankle_roll_skel"], skel.bone_index["right_ankle_r
 | Relative speed | ✅ but floored ~0.4 m/s, saturating | — |
 | Exact speed (any value) | ❌ (numbers ignored) | ✅ Root2D, no floor (calibrate for G1 root) |
 | Exact step length | ❌ | ✅ foot EE, ~1 cm |
+| Torso lean / posture | ❌ (posture words ignored) | ✅ FullBody positions, ~2–3° |
 | Alternative gait (shuffle/pauses) | ❌ substituted to a walk | ✅ indirectly (slow constraint → low foot-lift; foot pins → arbitrary) |
 | Exact path / turn / waypoints | ❌ | ✅ Root2D (x,z) |
 
