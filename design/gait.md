@@ -420,6 +420,27 @@ Same **two ramp variants** (with / without very-slow start+stop + settle-stand) 
 Backward locomotion works with a **fixed forward heading + reverse root path** (confirmed in the diversity
 batch); expect the step-length ceiling to apply identically.
 
+### Seed diversity at a fixed config — replication is worth it (measured)
+
+The plan replicates each config across ~200 seeds. **That's justified:** even with the *speed and root path
+fully pinned* (go forward, 0.5 m/s, 16 seeds), the gaits vary meaningfully — all in *execution style*, not
+trajectory:
+
+| descriptor | range across 16 seeds | CV |
+|---|---|--:|
+| step length | 28 – 44 cm | 13 % |
+| cadence | 1.2 – 2.0 footfalls/s | 13 % |
+| foot lift | 12 – 17 cm | 10 % |
+| arm swing | 6.5 – 34 cm | **44 %** |
+| torso pitch | 4 – 29° | **64 %** |
+| lead foot | 6 L / 10 R | — |
+
+Because `speed = step × cadence` is fixed, seeds sample the **step↔cadence tradeoff** (mincing 28 cm @ 2 Hz ↔
+striding 44 cm @ 1.2 Hz) *along the constant-speed curve*, **plus** largely-independent spread in **arm swing**
+and **torso posture** (the biggest movers) and both **gait phases** (which foot leads). So per-config seed
+replication yields a genuine distribution of natural gait styles, not near-duplicates. (The root *path* is
+identical by construction — this is the intra-condition style diversity a per-config sample should provide.)
+
 ---
 
 ## 10. Long trajectories — stitching past the length limit
