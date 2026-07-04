@@ -345,3 +345,76 @@ pitch = np.degrees(np.arctan2((up-p)[:,2], (up-p)[:,1]))      # +Z forward vs +Y
 **Rule of thumb:** the model faithfully renders text toward motions that are *densely represented in the
 mocap*, and silently substitutes the nearest walk for anything off-distribution (sub-0.4 m/s cruise,
 shuffles, pauses, numeric targets). For exact kinematics, drive the **constraints**, not the prompt.
+
+---
+
+## 9. Data-generation plan
+
+The dataset below is the **authoritative generation spec**. Three phases, **32 h of motion each (96 h total)**.
+Everything is **constraint-driven** (the prompt can't hit any of these numeric targets — §1). Every generator
+recipe is in §2–§4; this section is the *what to generate* plus the *gotchas that must be honored or the
+labels will be wrong*.
+
+**Global rules**
+- **≤ 8 s per trajectory** = 240 frames @ 30 fps — safely inside the model's validated ≤10 s range (demo
+  `MAX_DURATION`) and far under its 5000-frame positional-encoding cap (~167 s). Budget the 8 s to fit
+  ramp + cruise + ramp when ramps are included.
+- **Fill the hour budget with seeds.** A phase has only tens of distinct parameter configs; 32 h ÷ 8 s ≈
+  **14,400 clips/phase**, so replicate each config across **~200 random seeds** for natural gait diversity.
+  Put `{phase, param, seed}` in the filename/metadata — reproducibility + de-dup.
+- **Throughput** (measured, one RTX 3090 Ti): ~2.5 motion-s per wall-s at 100 denoising steps → **~38 wall-h
+  for 96 h**. Batching saturates at B≈4 (compute-bound); the real lever is denoising steps — 20 steps ≈ 11
+  motion-s/wall-s (~9 h) *after* eyeballing quality. Embarrassingly parallel → divide by GPU count.
+- **Storage**: ~30 GB (full `.npz`) or ~15 GB (qpos CSV only) for all ~43k clips. Decide format up front.
+
+### ⚠ Two hard limits that break the plan as written — do not ignore
+1. **Step length has a kinematic ceiling that scales with the robot's leg length** — it is *per-skeleton*, not
+   absolute. **On G1** (~0.7 m leg): faithful to ~1 cm up to **0.4 m**; **0.7 m** tracks ~95 % with a late fade;
+   **> 0.7 m collapses** — commanding **1.0 m yields ~0.44 m**, an irregular scramble with extra inserted steps.
+   The **1.0 m end of the grid is meant for a taller skeleton** (e.g. SOMA-77 / SMPL-X human-scale, longer legs),
+   where it is reachable. **So for G1, configs above ~0.7 m will be mislabeled if saved at face value.** Per robot:
+   (a) cap the grid near ~1× that skeleton's leg length, or (b) generate past it but store the **measured** step
+   length as the label, flagged `degraded`. Also (all skeletons): first step from a standstill overshoots; soft
+   floor (small +bias) below ~0.15 m on G1.
+2. **Speed retarget is not 1:1 below ~0.25 m/s.** The G1 qpos root runs short of the commanded Kimodo path,
+   speed-dependent, with a **knee at 0.25 → 0.20 m/s** (~1 % gap above, 9–24 % below). The grids start at
+   0.25 m/s, which sits *on* the knee — **calibrate per target** (secant loop, §2) so 0.25 lands at 0.25, not ~0.18.
+
+### Phase 0 — forward, speed & step-length grids (32 h)
+| Sweep | Values | Lever | Key caveat |
+|---|---|---|---|
+| Forward **velocity** | 0.25 → 1.00 m/s, step 0.05 → **16** | Root2D constant-velocity path (§2) | calibrate retarget per speed; 0.25 is on the knee |
+| Forward **step length** | 0.10 → 1.00 m, step 0.05 → **19** | foot EE constraints (§3) | **only ≤0.7 m is faithful** — see limit ①|
+
+Each config saved in **two variants** → ~35 base × 2 = **70 configs**:
+- **without ramp** — steady cruise the whole clip (constant Root2D velocity / uniform footfall grid).
+- **with ramp** — very-slow **start** (ramp 0→cruise) + very-slow **stop** (cruise→0), ending in a **clean square
+  stand**. Use a Root2D *velocity profile* for the ramp (the prompt's start/stop envelope is inexact, §1), and
+  append the **settle + FullBody stand-pin** — hold the final velocity/heading ~1–2 s, then pin a square
+  standing pose (`go_forward[0]` rotated to the final facing) over the last ~8 frames via FullBody — so the
+  clip doesn't freeze mid-stride (raw stops end ~20 cm staggered and still moving; the pin squares feet to 0 cm).
+
+### Phase 1 — curves & turns (32 h)
+| Sweep | Values | Lever | Key caveat |
+|---|---|---|---|
+| **Left curve** radius | 2.0 → 10.0 m × {velocity or step length} | Root2D circular path (§2) | **pin heading to tangent** or it crabs |
+| **Right curve** radius | 2.0 → 10.0 m × {velocity or step length} | Root2D circular path, mirrored | negate lateral / `dsign`; same heading pin |
+| **Turn-around** angular vel | 0.5 → 2.0 rad/s | Root2D: heading rotates at ω, root pinned in place | no ceiling; settle + stand-pin to end square |
+
+- **Heading MUST be pinned to the path tangent** (`θ = atan2(f_x, f_z)`) on every curve — unpinned, the body
+  strafes sideways (crab ≈ 90°), worst on gentle/large-radius curves.
+- **Radius calibration**: tight curves come out ~5 % *small* (2.0→1.91), gentle ones ~1.5 % *large* (10.0→10.15) —
+  command a corrected radius if you need it exact. Circle-fit residual is ~2 cm regardless.
+- **Turn rate**: 0.5–2.0 rad/s all land within a few % (0.54/1.03/1.48/2.03), root stays in place (~10 cm), **no
+  saturation** even at 2.0 rad/s. Duration scales as 180°/ω (0.5 rad/s ≈ 6.3 s — still ≤8 s).
+- Pick the radius sub-step (e.g. 1 m → 9 radii) and the ω sub-step (e.g. 0.25 → 7 rates); grids × seeds fill 32 h.
+
+### Phase 2 — backward, speed & step-length grids (32 h)
+| Sweep | Values | Lever | Key caveat |
+|---|---|---|---|
+| Backward **velocity** | 0.25 → 1.00 m/s, step 0.05 → **16** | Root2D root −Z, **heading fixed +Z** (§2) | face forward, walk backward (validated) |
+| Backward **step length** | 0.10 → 1.00 m, step 0.05 → **19** | foot EE constraints on a −Z grid (§3) | same ~0.7 m ceiling — see limit ①|
+
+Same **two ramp variants** (with / without very-slow start+stop + settle-stand) as Phase 0.
+Backward locomotion works with a **fixed forward heading + reverse root path** (confirmed in the diversity
+batch); expect the step-length ceiling to apply identically.
