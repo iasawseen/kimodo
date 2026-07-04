@@ -9,6 +9,73 @@ Everything here is empirical — measured from generated trajectories, not from 
 
 ---
 
+## Pipeline & acceptance goal — what this gait control feeds
+
+Kimodo is **stage 0** of a human-like data-generation pipeline. Gait control here is upstream tooling;
+the data that actually ships is whatever survives all three stages:
+
+| Stage | What it does | Adds |
+|---|---|---|
+| **0. Kimodo** | text + kinematic constraints → skeletal motion | *the reference* — kinematic, no dynamics (everything below characterizes this) |
+| **1. Retarget** (SOMA-style) | map the skeletal motion onto the target robot's morphology / joint limits | robot-feasible joint trajectories |
+| **2. WBC replay** | track the retargeted reference in physics with a whole-body-control / RL policy | **dynamics** — balance, contact, actuation limits |
+
+For **G1 specifically**, stages 0–1 are largely fused: `kimodo-g1-rp` already emits a G1-34 skeleton and the
+MuJoCo qpos converter finishes the mapping — the **"retarget gap" in §2 is precisely a stage-1 artifact** (the
+G1 root under-travels the commanded path). A *different* robot needs a real SOMA-style retargeter at stage 1.
+
+**Acceptance goal (`/goal` — evaluated on the stage-2 output; conditions are updatable):** a clip is *valid
+data* only if the WBC-replayed motion is physically clean. Current conditions:
+
+- **nearly vertical spine** — torso stays upright (pelvis→torso vector within a small tilt off gravity);
+- **no self-collision** — no link interpenetration;
+- *(extensible — expect to add: feet don't skate / penetrate the floor, joint limits respected, no fall / COM
+  stays over the support polygon, actuation feasible, temporally smooth).*
+
+This is the physical-plausibility gate the doc otherwise flags as unknown ("whether such a pose is trackable on
+hardware," §4) — the **WBC stage is where it actually gets decided**, not at generation time.
+
+**Read the rest of this doc through this filter.** Kimodo emits kinematically-fine references that can still
+fail these conditions after WBC. The couplings that move the most data:
+
+| Acceptance condition | Kimodo knob that fights it | What to do |
+|---|---|---|
+| vertical spine | **torso lean (§4)** — deliberate incline; **and** the *free* torso-pitch spread across seeds (4–29°, §9) | keep lean ≈ 0 for a vertical-spine set; **filter or FullBody-pin** the leaning seed tail; treat §4 as a *negative* knob unless leaning data is the goal |
+| no self-collision | **extreme geometry** — step length near the ceiling (§3), tight / heading-unpinned curves that crab sideways (§2), sharp turns ending cross-legged (§9 Phase 1) | stay inside the reproducible envelope (G1 step ≤ ~0.7 m); **pin heading** on curves; use the **turn-settle** recipe so legs finish square |
+| reproducible root path | **retarget gap + step-length collapse** (§2, §3) | command inside the calibrated range; expect the WBC to under-track — **verify on the stage-2 output, not the Kimodo root** |
+
+Net: this doc says *what Kimodo can produce*; the acceptance goal decides *which subset is data*. When the
+conditions change, re-check the two couplings above (spine ↔ lean, self-collision ↔ geometry) first.
+
+### Closing the loop — Claude tunes the constraints until `/goal` passes
+
+Generation is **not one-shot.** The Kimodo constraints (`Root2DConstraintSet`, foot-EE `Left/RightFootConstraintSet`,
+`FullBodyConstraintSet`) are the *only* tuning surface upstream of the WBC, and Claude **can and should** edit them
+and regenerate until the stage-2 replay satisfies `/goal`. Treat a WBC acceptance failure as the spec for the
+*next* generation, not a dead end:
+
+```
+generate(constraints) → retarget → WBC replay → evaluate vs /goal
+        ▲                                              │
+        └─────── fails? tighten / change a constraint ─┘   (repeat)
+```
+
+Remediation by observed WBC failure:
+
+| WBC failure | Constraint edit to make, then regenerate |
+|---|---|
+| spine tilts past tolerance | add / tighten a **FullBodyConstraintSet** pinning the torso chain upright (run §4 with target lean 0°); or drop the leaning seed and re-roll |
+| self-collision (legs / arms) | **cap step length** below the ceiling (§3); **pin heading** to the path tangent on curves (§2); append the **turn-settle** stance pin (§9) so legs finish square; widen the footfall lateral offset |
+| foot skate / float / ground penetration | re-calibrate the **retarget gap** at this speed (§2 secant loop); keep speed above the ~0.25 m/s knee; pin footfalls with **foot-EE constraints** (§3) rather than trusting the prompt |
+| falls / COM leaves the support polygon | reduce commanded speed / step; soften start-stop ramps (Root2D velocity profile, §9); avoid near-ceiling geometry |
+
+**Iterate, then decide.** Loop constraint→regenerate→re-evaluate a few times; if *no* setting inside the
+reproducible envelope passes, the target is **infeasible for G1 at this condition** — report that (with the
+closest passing config) rather than shipping a clip that fails `/goal`. This loop is also the mechanism that
+re-satisfies `/goal` whenever its conditions are updated.
+
+---
+
 ## 0. Decision table — "I want X"
 
 | Goal | Lever | Accuracy | Notes |
@@ -141,7 +208,7 @@ walk and translate them onto the target grid** (preserves natural foot geometry 
 import numpy as np, torch
 from kimodo.constraints import LeftFootConstraintSet, RightFootConstraintSet
 
-ref  = np.load("outputs/go_forward.npz")                      # any prior G1 walk
+ref  = np.load("outputs/gait/go_forward.npz")                 # any prior G1 walk
 pj   = torch.tensor(ref["posed_joints"],  dtype=torch.float32, device=device)   # [T,34,3] Kimodo frame
 grot = torch.tensor(ref["global_rot_mats"], dtype=torch.float32, device=device) # [T,34,3,3]
 fc   = ref["foot_contacts"].astype(bool)                      # [T,4] = L-heel,L-toe,R-heel,R-toe
@@ -210,7 +277,7 @@ axis), then pin the leaned pose with `FullBodyConstraintSet` at keyframes:
 import numpy as np, torch
 from kimodo.constraints import FullBodyConstraintSet
 
-ref  = np.load("outputs/go_forward.npz")                       # the gait to lean (legs come from here)
+ref  = np.load("outputs/gait/go_forward.npz")                  # the gait to lean (legs come from here)
 pj   = torch.tensor(ref["posed_joints"],  dtype=torch.float32, device=device)   # [T,34,3]
 grot = torch.tensor(ref["global_rot_mats"], dtype=torch.float32, device=device) # [T,34,3,3] (required, unused)
 UPPER = list(range(15, 34))                                    # waist + both arms

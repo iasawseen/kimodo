@@ -29,7 +29,7 @@ from kimodo.model.load_model import load_model
 from kimodo.tools import seed_everything
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # tools/ -> repo root
-DEFAULT_OUT_DIR = os.path.join(_REPO, "outputs")
+DEFAULT_OUT_DIR = os.path.join(_REPO, "outputs", "gait")
 _MODELS = {}
 
 
