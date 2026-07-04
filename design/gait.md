@@ -341,6 +341,7 @@ pitch = np.degrees(np.arctan2((up-p)[:,2], (up-p)[:,1]))      # +Z forward vs +Y
 | Torso lean / posture | ❌ (posture words ignored) | ✅ FullBody positions, ~2–3° |
 | Alternative gait (shuffle/pauses) | ❌ substituted to a walk | ✅ indirectly (slow constraint → low foot-lift; foot pins → arbitrary) |
 | Exact path / turn / waypoints | ❌ | ✅ Root2D (x,z) |
+| Long / continuous (>10 s) | ❌ single gen degrades & stops | ✅ stitch constant-velocity segments (§10) |
 
 **Rule of thumb:** the model faithfully renders text toward motions that are *densely represented in the
 mocap*, and silently substitutes the nearest walk for anything off-distribution (sub-0.4 m/s cruise,
@@ -418,3 +419,34 @@ Each config saved in **two variants** → ~35 base × 2 = **70 configs**:
 Same **two ramp variants** (with / without very-slow start+stop + settle-stand) as Phase 0.
 Backward locomotion works with a **fixed forward heading + reverse root path** (confirmed in the diversity
 batch); expect the step-length ceiling to apply identically.
+
+---
+
+## 10. Long trajectories — stitching past the length limit
+
+**Single-shot length is capped.** One generation is trained/validated to **≤ 10 s** (demo `MAX_DURATION`);
+past that, quality degrades — a 10 s "go forward" already *decelerates to a stop* at the end (training clips
+end at rest). The hard ceiling is **5000 frames ≈ 167 s** (sinusoidal positional-encoding buffer,
+`backbone.py` `PositionalEncoding.max_len`); beyond it the model errors. So for anything long, **don't
+generate one big clip — tile and stitch.**
+
+**Recipe** (validated: continuous **62 s** "go forward" at a flat **1.00 m/s**, no stops, 2–7 cm seams):
+1. Generate N segments (~8 s each) as **constant-velocity Root2D cruises** — no start/stop ramp, so each
+   segment holds speed to its final frame (no mid-clip deceleration).
+2. **Pin the first ~8 frames of segment i to the last ~8 frames of segment i−1** via `FullBodyConstraintSet`
+   (positions) — makes the body pose *and foot phase* continuous across the seam.
+3. Translate each segment into one global timeline (root keeps advancing) and **drop the overlap** frames,
+   or linearly **crossfade** them (`blend`) for near-zero seams (2–7 cm → ~2 cm).
+
+Result: one continuous walk at full per-segment quality, arbitrarily long — the same tiling that scales the
+dataset. A reference **`stitch()` helper** (`tools/stitch.py`) implements it:
+
+```python
+from tools.stitch import stitch
+stitch("go forward", speed=1.0, duration=60, out_stem="go_forward_60s", blend=True)  # -> qpos [T,36] + CSV
+# CLI: python tools/stitch.py "go forward" 1.0 60 --out go_forward_60s --render --blend
+```
+
+**Limitation:** the join is **translation-only → straight-line locomotion**. Curved long paths need per-seam
+heading rotation (rotate the pinned tail + the continuing root path by the accumulated heading) — not yet
+implemented. Speed is constant across the whole trajectory.
