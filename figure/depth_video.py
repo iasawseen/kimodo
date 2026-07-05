@@ -15,11 +15,16 @@ affine 'a'; translation: mean camera-center residual). Every frame gets cam_R/ca
 camera-from-CHAIN extrinsics whose units match the stitched depth - this is what makes lifted
 skeletons world-consistent under a MOVING camera.
 
-Usage (env sam_3d_body, GPU 0):
+Usage (env kimodo or sam_3d_body, GPU 0):
     CUDA_VISIBLE_DEVICES=0 DEPTH_WORK=<workdir> python figure/depth_video.py <ckpt.pt>
 Env: VGGT_WINDOW (default 160; 192 fits in 24 GiB), VGGT_STRIDE (default 120).
 Outputs: <workdir>/depth/f%05d.npz  {depth[h,w] f16, conf[h,w] f16, pose_enc[9] f32,
                                      cam_R[3,3] f32, cam_T[3] f32}
+
+Image preprocessing is a local PIL+torch replica of vggt_omega.utils.load_fn
+.load_and_preprocess_images (bit-identical for its defaults: mode="balanced",
+image_resolution=512, patch_size=16) - the upstream helper pulls in torchvision, which the
+kimodo env does not have; the VGGTOmega model itself is torchvision-free.
 """
 import glob
 import os
@@ -27,10 +32,50 @@ import sys
 
 import numpy as np
 import torch
+from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "vggt-omega"))
 from vggt_omega.models.vggt_omega import VGGTOmega           # noqa: E402
-from vggt_omega.utils.load_fn import load_and_preprocess_images  # noqa: E402
+
+
+def load_and_preprocess_images(paths, image_resolution=512, patch_size=16):
+    """Torchvision-free replica of vggt_omega.utils.load_fn.load_and_preprocess_images
+    (mode="balanced"): center-crop extreme aspect ratios into [0.5, 2.0], resize so the
+    token count stays near (image_resolution/patch_size)^2, ToTensor (float32/255)."""
+    token_number = (image_resolution // patch_size) ** 2
+    images, shapes = [], set()
+    for p in paths:
+        with Image.open(p) as im:
+            if im.mode == "RGBA":
+                im = Image.alpha_composite(Image.new("RGBA", im.size, (255, 255, 255, 255)), im)
+            im = im.convert("RGB")
+        w, h = im.size
+        ar = h / max(w, 1)
+        if ar < 0.5:                                         # too wide -> crop width
+            cw = min(w, max(1, int(round(h / 0.5))))
+            left = max((w - cw) // 2, 0)
+            im = im.crop((left, 0, left + cw, h))
+        elif ar > 2.0:                                       # too tall -> crop height
+            ch = min(h, max(1, int(round(w * 2.0))))
+            top = max((h - ch) // 2, 0)
+            im = im.crop((0, top, w, top + ch))
+        w, h = im.size
+        ar = h / max(w, 1)
+        wp = max(1, int(np.round(np.sqrt(token_number / ar))))
+        hp = max(1, int(np.round(token_number / np.sqrt(token_number / ar))))
+        im = im.resize((wp * patch_size, hp * patch_size), Image.Resampling.BICUBIC)
+        t = torch.from_numpy(np.array(im, np.uint8)).permute(2, 0, 1).float().div_(255.0)
+        shapes.add((t.shape[1], t.shape[2]))
+        images.append(t)
+    if len(shapes) > 1:                                      # pad to common size (value 1.0)
+        mh = max(s[0] for s in shapes); mw = max(s[1] for s in shapes)
+        for k, t in enumerate(images):
+            ph, pw = mh - t.shape[1], mw - t.shape[2]
+            if ph > 0 or pw > 0:
+                images[k] = torch.nn.functional.pad(
+                    t, (pw // 2, pw - pw // 2, ph // 2, ph - ph // 2), value=1.0)
+    return torch.stack(images)
+
 
 WORK = os.environ["DEPTH_WORK"]
 CKPT = sys.argv[1]

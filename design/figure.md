@@ -23,7 +23,11 @@ per-lever control recipes (speed / step length / turns / EE constraints) this bu
 | `figure/render_scene.py` | fixed-camera renderer; animates door hinge + rack slide from segment bounds; `--sheet` for an 8-frame QA contact sheet |
 | `figure/check_collisions.py` | collision QA gate (robot vs scene solids + self-collision) |
 | `figure/gen_gestures.py` | gesture prompt probe (which gestures work under a station pin) |
-| `figure/pose_video.py`, `figure/pose_retarget.py` | SAM-3D-Body runner (per-frame MHR-70) + direction-transfer retarget to G1-34 (§7.1) |
+| `figure/pose_video.py`, `figure/pose_retarget.py` | SAM-3D-Body runner (per-frame MHR: keypoints + mesh + rotations, §7.1) + direction-transfer anchor retarget (§7.1) |
+| `figure/soma_retarget.py`, `figure/render_replay.py` | SOMA-style retarget fit3d → G1 qpos (direction transfer + MuJoCo DLS IK) + vertical video/MuJoCo replay renderer, plain or kitchen scene (§7.8) |
+| `figure/sam3d_dummy_video.py`, `figure/sam3d_mesh_video.py` | chirality evidence: raw SAM 3D skeleton / 3D mesh renders (mesh cache-first from saved `verts`; §7.1) |
+| `figure/gpurender.py` | shared torch-CUDA raster utils (splat/lines/cloud/resize/colormap) used by all video renderers (§7.9) |
+| `figure/lift_mesh.py`, `figure/mesh_world_video.py` | world-lift + temporal smoothing of the SAM meshes (fit_pose transform chain per vertex) + two-pane render (§7.9) |
 | `figure/depth_video.py`, `figure/lift_skeleton.py`, `figure/fit_pose.py` | MotionRecon core: VGGT-Omega depth, world alignment + naive lift, rigid fitter + smoother (§7.2–7.5) |
 | `figure/fit_kitchen.py` | kitchen fit + camera solve from the reconstruction (§7.6) |
 | `figure/skel_draw.py`, `figure/birdseye_video.py`, `figure/pose_over_cloud.py`, `figure/recon3d_video.py`, `figure/recon_check_video.py` | visualization / verification videos (§7.6) |
@@ -191,16 +195,40 @@ figure.mp4 (1280x720 frames, 23.976 fps)
 - Checkpoint from the **ModelScope mirror** (`facebook/sam-3d-body-dinov3`; HF repo is gated);
   torch.jit `mhr_model.pt` — no detectron2 needed. Manual/interpolated bboxes
   (`boxes.npz`) bypass the human detector.
-- Output per frame: **MHR-70** keypoints — `kp2d` (pixels), `kp3d` (metric, root-relative),
-  `cam_t` (camera translation). Indices used: hips 9/10, knees 11/12, ankles 13/14, shoulders
-  5/6, elbows 7/8, wrists L62/R41, neck 69, heels 17/20, toes 15/18, nose 0.
+- Output per frame (`mhr/f%05d.npz`): **MHR-70** keypoints — `kp2d` (pixels), `kp3d` (metric,
+  root-relative), `cam_t` (camera translation) — **plus the full MHR body**: `verts` (mesh
+  vertices, f16; topology in `mhr/faces.npy`), `global_rot` (body orientation — the explicit
+  facing direction), `joint_rots` (per-joint global rotations, f16), `joint_coords`,
+  `body_pose`/`shape`/`scale` params. Keypoint indices used: hips 9/10, knees 11/12, ankles
+  13/14, shoulders 5/6, elbows 7/8, wrists L62/R41, neck 69, heels 17/20, toes 15/18, nose 0;
+  hands R 21–41 / L 42–62 (5 fingers × 4 joints, tip→MCP, + wrist).
+  Older caches carry only the keypoint keys; `PV_FORCE=1` re-runs frames to add the rest.
 - **kp2d is in the processed-frame pixel space (1280×720 here) — not the source 1920×1080.**
   A wrong `W_IMG` scaled every ray by 2/3 and silently corrupted all downstream world positions;
   the symptom was skeletons floating off the robot in every 3D view.
 - Reliability: bone lengths stable to 3.4–6.9 % per frame; **absolute depth (`cam_t`) wobbles
-  ±0.36 m even when the robot is static** (scale-from-appearance noise); L/R flips on the
-  faceless robot (~40 % of frames) are handled in `pose_retarget.py` by mirror-vote
-  stabilization. **First 4 s are discarded** (`ok &= t >= 4.0`): robot absent/partial there.
+  ±0.36 m even when the robot is static** (scale-from-appearance noise). **First 4 s are
+  discarded** (`ok &= t >= 4.0`): robot absent/partial there.
+- **Front/back chirality**: on the faceless robot SAM resolves roughly half the frames as a
+  depth-mirrored, L/R-swapped estimate (a mirrored pose projects to the SAME 2D image — the
+  ambiguity is invisible in every 2D overlay and only bites 3D consumers, e.g. the retarget,
+  where a surviving mirrored stretch reads as the robot spinning 180°). Confirmed on the raw
+  MESH renders: consecutive side views snap 180° while the video robot stands still
+  (`sam3d_mesh_video.py`: mesh overlay + 90° side view — front/back is unambiguous on the
+  shaped body; `sam3d_dummy_video.py`: 3D skeleton variant). **An in-fitter fix
+  (`MR_FLIPFIX`) was tried and REVERTED**: un-mirroring frames inside `fit_pose.py` makes the
+  corrected 3D deliberately disagree with the 2D image on flipped frames, which visibly breaks
+  every image-space fit3d consumer (collate cloud pane, pose_over_cloud, BEV). Architecture
+  lesson: `fit3d.npz` stays faithful to SAM's per-frame estimates (2D-consistent); chirality
+  correction belongs DOWNSTREAM in the retarget layer (or in a side-channel artifact), never
+  inside the shared fit. Attempt history for that layer: per-frame median vote → greedy
+  hip-line continuity → global 2-state Viterbi (velocity-alignment unaries + hip-line
+  continuity + switch penalty) reached 88 % walk-frame alignment but left 23 >45°/frame
+  heading jumps; greedy and median rules specifically fail in PROFILE views where the mirror
+  barely changes the hip line. Two hard-won constraints for the next attempt: correct on raw
+  per-frame estimates BEFORE smoothing (smoothing blends mirror flickers into unrecoverable
+  averages), and prefer the now-saved `global_rot`/`joint_rots` (§7.1) — a full-orientation
+  observation — over reconstructed hip lines.
 
 ### 7.2 VGGT-Omega (github.com/facebookresearch/vggt-omega)
 
@@ -344,3 +372,68 @@ with the mid-hip pinned to the subject (the pelvis rides its kp2d ray, so its pi
 - **Irreducible residual**: MHR-70 has no head-top keypoint — the skeleton tops at the nose, so
   it under-covers the subject's silhouette by construction (figure: kp2d spans 0.71 of the
   detector bbox). Cosmetic, not a scale error; extrapolate a head-top point if it matters.
+
+### 7.8 SOMA-style retarget: fit3d → G1 replay in MuJoCo (`soma_retarget.py`)
+
+Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo:
+
+- **Source = the 3D poses** (`fit3d.npz`): articulation from SAM, trajectory from the VGGT
+  world calibration (already G1 scale). SAM alone is enough for *directions* but not for the
+  trajectory (`cam_t` wobbles ±0.36 m standing still) — and its chirality ambiguity hits every
+  3D consumer regardless of source (§7.1).
+- **Direction transfer** (per frame, yaw-normalized about the hip line like `pose_retarget.py`)
+  → G1-34 joint-position targets with exact G1 bone lengths, placed at the fit3d mid-hip.
+  Leg-splay damp 0.55 and 15 % leg straightening carried over. A **residual-yaw assert** guards
+  the normalization: the original sign bug here (rotating by −yaw, i.e. ~180° off in the
+  work phase where the hip line sits at yaw ≈ 90°) produced arms-overhead nonsense.
+- **Root analytically** (mid-hip + orthonormal hip/torso frame; pelvis origin sits 0.1027 above
+  the hip line in the XML), **29 hinge dofs by damped-least-squares IK** on the real G1 MuJoCo
+  model: 10 tracked bodies (knees/ankles ×2.0/elbows/wrists ×1.5/shoulders ×1.2) + toe points
+  fixed in the ankle frames, XML joint limits clamped per iteration, warm-started; ~0.04–0.06
+  weighted residual. Then gap interpolation, 5-median+7-box qpos smoothing (hemisphere-aligned
+  quats), soft ground clamp.
+- **Renderers** (`render_replay.py`, vertical video-over-MuJoCo): `SCENE=plain` puts the camera
+  at the reconstructed video camera (lift3d pose + VGGT fovy) — the robot appears where the
+  real one is; `SCENE=kitchen` translates the trajectory into the reproduction kitchen by
+  (scene work spot − `kitchen_fit.json` pocket) — both frames are +X = work-facing by
+  construction — with the dishwasher door/rack held open.
+- **Honest gaps**: G1 bends less than the Figure robot (waist pitch caps at ±0.52 rad; the
+  morphology gap is real, not a tracking error); arms track approximately (position IK, no
+  orientation targets yet). **Chirality is unresolved at this layer**: fit3d arrives faithful
+  to SAM's mirror-afflicted estimates (the in-fitter fix was reverted, §7.1), so mirrored
+  stretches surface as spurious 180° turns in the replay. Next: resolve chirality INSIDE the
+  retarget (fit3d stays untouched) using the saved `global_rot` as the facing observation, and
+  move to a rotation-based retarget from per-joint `joint_rots`.
+
+### 7.9 Mesh lifting + GPU rendering infrastructure
+
+- **World-lifted, time-smoothed meshes** (`lift_mesh.py`): every frame's 18439-vertex SAM mesh
+  goes through the IDENTICAL transform chain as the skeleton fit — pelvis on the kp2d mid-hip
+  ray at the fitted body depth `b[n]`, offsets scaled by the fitted ratio `a[n]`, per-frame
+  `M_c2w`, kappa rescale about the pelvis — all read back from `fit3d.npz`/`lift3d.npz`, no
+  recomputation. Constant topology ⇒ vertices are in correspondence across frames and smooth
+  exactly like joints (same 7-median + 11-box, batched per-vertex on GPU). Output
+  `<DEPTH_WORK>/mesh_w.npz` (cache dir — ~0.5 GB f16 for figure). `mesh_world_video.py`
+  renders [frame + reprojected smoothed mesh | fixed 3/4 world view over the scene cloud];
+  the reprojection pane must apply the §7.7 `body_fix` (divide pelvis-relative offsets by
+  `kappa`, focal ratio F_SAM/√(fx·fy)) — verified: mesh/kp2d span 0.84 pre-fix → 0.95–0.98
+  post-fix on vera_short. Figure caveat: SAM's mirror flicker (§7.1) smears the smoothed mesh
+  inside flicker runs until chirality is resolved downstream.
+- **GPU rendering** (`gpurender.py` + ports): all video renderers moved to torch-CUDA —
+  point-cloud splats in painter's order, resizes, colormaps, pane compositing on device; NVENC
+  encode via `fastvid`; skeleton/text overlays stay on PIL/skel_draw (cheap, already correct,
+  now drawn in bbox crops). Verified frame-matched vs the CPU references on vera_short (365
+  frames): birdseye 52→7 s (the CPU version was also O(N²) in the trail — now incremental),
+  collate 22→13 s (57 ms/frame single-proc, 4.5×), pose_over_cloud 90→24 s, recon_check
+  47→17 s, sam2d 7 s; `depth_video.py` no longer needs torchvision (runs in the kimodo env).
+  Known accepted deltas: bilinear-antialias resize (vs PIL bicubic) and float z-order splat
+  ties — both below the NVENC noise floor.
+- **Torch mesh rendering** (`gpurender.sample_mesh`/`mesh_splat`): pyrender replaced by
+  surface splatting — one-time area-weighted barycentric sampling of the constant-topology
+  MHR mesh (~300–900k points by density), then per frame: barycentric gather, face-normal
+  two-sided headlight Lambertian, perspective project, painter-ordered z-splat. 6.6 ms/frame
+  at density 8 vs ~400–460 ms pyrender. Ports verified frame-matched: `mesh_world_video.py`
+  80→13.5 s, `sam3d_mesh_video.py` 169→9.7 s on vera_short (figure full-rate ~110 s vs
+  ~40 min). Both mesh renderers now run in the kimodo env (no pyrender/cv2); accepted deltas:
+  splat stipple vs smooth Phong, hard edges vs AA. Every `figure/` video renderer is now
+  torch-CUDA end-to-end (decode → composite → NVENC).

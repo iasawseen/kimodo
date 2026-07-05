@@ -6,12 +6,19 @@ space it was predicted in - no reprojection, no focal/kappa considerations (desi
 section 7.7 applies only to fit3d reprojection). Replaces the ephemeral one-off that built
 outputs/figure/figure_sam3d.mp4 body-only.
 
+Perf port: there is no resize/compositing here to move to the GPU - the frame IS the native
+decoded JPEG and the skeleton stays on PIL/skel_draw by design. The heavy per-frame work
+(JPEG decode + supersampled skeleton draw, both GIL-releasing PIL C ops) runs in a bounded
+thread pipeline so it overlaps the NVENC write; frames are still written strictly in order.
+
 Usage: POSE_WORK=<workdir with frames/ + mhr/> [MR_FPS=..] [OUT=path.mp4] \
        python figure/sam2d_video.py
 """
 import glob
 import os
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
@@ -39,19 +46,33 @@ KIDX = list(KP.values())
 frames = sorted(glob.glob(os.path.join(WORK, "frames", "f*.jpg"))) or \
     sorted(glob.glob(os.path.join(WORK, "frames", "f*.png")))
 W, H = Image.open(frames[0]).size
-wr = VideoWriter(OUTP, W, H, FPS)
-drawn = 0
-for i, fp in enumerate(frames):
+
+
+def render(fp):
+    """Decode + (maybe) skeleton-draw one frame; independent per frame -> thread-safe."""
     img = np.asarray(Image.open(fp).convert("RGB"))
     key = os.path.basename(fp).rsplit(".", 1)[0]
     mf = os.path.join(WORK, "mhr", key + ".npz")
     if os.path.exists(mf):
         kp2d = np.load(mf)["kp2d"]
         if np.ptp(kp2d[:, 1]) <= 1.5 * H and np.ptp(kp2d[:, 0]) <= 1.5 * W:   # skip degenerate
-            img = draw_skeleton(img, kp2d[KIDX], scale=H / 1080 + 0.3)
-            drawn += 1
-    wr.write(img)
-    if i % 1200 == 0:
-        print(f"[sam2d] {i}/{len(frames)}", flush=True)
+            return draw_skeleton(img, kp2d[KIDX], scale=H / 1080 + 0.3), 1
+    return img, 0
+
+
+wr = VideoWriter(OUTP, W, H, FPS)
+drawn = 0
+NW = min(8, os.cpu_count() or 4)
+Q = 2 * NW                                               # bounded in-flight window
+with ThreadPoolExecutor(max_workers=NW) as ex:
+    pend = deque(ex.submit(render, fp) for fp in frames[:Q])
+    for i in range(len(frames)):
+        img, d = pend.popleft().result()
+        if i + Q < len(frames):
+            pend.append(ex.submit(render, frames[i + Q]))
+        drawn += d
+        wr.write(img)
+        if i % 1200 == 0:
+            print(f"[sam2d] {i}/{len(frames)}", flush=True)
 wr.close()
 print(f"[sam2d] WROTE {OUTP} ({len(frames)} frames, skeleton on {drawn})")

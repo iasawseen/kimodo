@@ -5,24 +5,33 @@ TOP: source figure.mp4 frame. BOTTOM: that frame's cloud (RGB-colored, confidenc
 re-rendered from the original camera orbited +33 deg vertically about a mid-scene pivot, with
 the rigid-fitter skeleton (fit3d.npz, green bones / yellow joints) drawn in the same view.
 
+GPU pipeline (torch CUDA): depth backprojection, the tilt reprojection and the painter's-order
+RGB splat (2x2 footprint) run on-device via gpurender; each source frame is decoded ONCE and
+resized on GPU for both panes; the skel_draw/PIL skeleton renders into its bounding-box crop
+only (identical pixels, ~5x less supersampled area than the full pane); NVENC encode.
+
 Usage: DEPTH_WORK=<pose_full dir> python figure/pose_over_cloud.py
 Output: outputs/figure/pose/pose_over_cloud.mp4
 """
+import glob
 import os
 
-import imageio.v2 as imageio
 import numpy as np
-from PIL import Image, ImageDraw
+import torch
+from PIL import Image
 
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from skel_draw import draw_skeleton  # noqa: E402
-from fastvid import VideoWriter, gpu_splat  # noqa: E402
+from fastvid import VideoWriter  # noqa: E402
+import gpurender as gr  # noqa: E402
+from gpurender import DEV  # noqa: E402
 
 WORK = os.environ["DEPTH_WORK"]
 _PKG = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(_PKG)
-OUTP = os.environ.get("POC_OUT", os.path.join(REPO, "outputs", "figure", "pose", "pose_over_cloud.mp4"))
+OUTP = os.environ.get("POC_OUT", os.path.join(
+    os.environ.get("MR_OUT", os.path.join(REPO, "outputs", "figure", "pose")), "pose_over_cloud.mp4"))
 FPS = float(os.environ.get("MR_FPS", 24000 / 1001))
 CONF_MIN = 1.2
 TILT = np.radians(float(os.environ.get("TILT_DEG", "33")))
@@ -51,13 +60,11 @@ d0 = np.load(os.path.join(WORK, "depth", "f00000.npz"))
 h, w = d0["depth"].shape
 SC = 960 / w
 PW, PH = int(w * SC) // 2 * 2, int(h * SC) // 2 * 2
-vs, us = np.mgrid[0:h, 0:w].astype(np.float32)
 FW, FH = Image.open(os.path.join(WORK, "frames", "f00000.jpg")).size
 
 # SAM's focal (processed-frame px): the fitted joints subtend SAM's ANGULAR sizes - projecting
 # with VGGT's focal shrinks the drawn skeleton by f_vggt/f_sam. Same fix as collate_video.
-import glob as _glob0
-_mhr = sorted(_glob0.glob(os.path.join(WORK, "mhr", "f*.npz")))
+_mhr = sorted(glob.glob(os.path.join(WORK, "mhr", "f*.npz")))
 _f = [float(z["focal"]) for f in _mhr[:: max(1, len(_mhr) // 25)]
       for z in [np.load(f)] if "focal" in z.files]
 F_SAM = float(np.median(_f)) if _f else 1468.6           # older caches: fixed SAM heuristic
@@ -78,31 +85,65 @@ def tilt_project(X, Y, Z, zmid, fx, fy):
     return PW / 2 + X / Zt * fx * SC, PH / 2 + Yt / Zt * fy * SC, Zt
 
 
+# GPU pixel grid + 2x2 splat footprint (same footprint/clamp semantics as fastvid.gpu_splat)
+_vs, _us = torch.meshgrid(torch.arange(h, dtype=torch.float32, device=DEV),
+                          torch.arange(w, dtype=torch.float32, device=DEV), indexing="ij")
+SQ2 = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], device=DEV)  # (dy,dx) offsets
+_CA, _SA = float(np.cos(TILT)), float(np.sin(TILT))
+
+
+def cloud_pane(D, C, src, fx, fy):
+    """Backproject conf-gated depth, orbit +TILT about the median depth, splat far-to-near.
+    D, C [h,w] float32 CUDA; src [h,w,3] uint8 CUDA -> (pane tensor, zmid)."""
+    good = C > CONF_MIN
+    Dg = D[good]
+    zmid = float(torch.quantile(Dg, 0.5)) if Dg.numel() else 1.0
+    X = (_us[good] - w / 2) / fx * Dg
+    Y = (_vs[good] - h / 2) / fy * Dg
+    Yt = _CA * Y - _SA * (Dg - zmid)
+    Zt = (_SA * Y + _CA * (Dg - zmid) + zmid).clamp(min=1e-4)
+    u = (PW / 2 + X / Zt * fx * SC).long().clamp(0, PW - 2)
+    v = (PH / 2 + Yt / Zt * fy * SC).long().clamp(0, PH - 2)
+    pane = gr.canvas(PH, PW)
+    gr.splat_cloud(pane, torch.stack([u, v], 1).float(), Zt, src[good], SQ2)
+    return pane, zmid
+
+
+def skel_patch(pc, pts):
+    """draw_skeleton confined to the joints' bounding box (+margin): identical pixels, far less
+    PIL supersampling area. All ink (bones, rings, head circle) stays within the joint hull
+    plus a few px of stroke radius, so a 64 px margin is conservative."""
+    fin = pts[np.isfinite(pts).all(1)]
+    if not len(fin):
+        return pc
+    x0 = max(int(fin[:, 0].min()) - 64, 0); x1 = min(int(fin[:, 0].max()) + 64, PW)
+    y0 = max(int(fin[:, 1].min()) - 64, 0); y1 = min(int(fin[:, 1].max()) + 64, PH)
+    if x0 >= x1 or y0 >= y1:
+        return pc
+    pc[y0:y1, x0:x1] = draw_skeleton(np.ascontiguousarray(pc[y0:y1, x0:x1]), pts - [x0, y0])
+    return pc
+
+
 wr = VideoWriter(OUTP, PW, PH * 2, FPS)
-import glob as _g
-N = len(_g.glob(os.path.join(WORK, 'depth', 'f*.npz')))
+N = len(glob.glob(os.path.join(WORK, 'depth', 'f*.npz')))
 for n in range(N):
     dz = np.load(os.path.join(WORK, "depth", f"f{n:05d}.npz"))
-    D = dz["depth"].astype(np.float32)
-    C = dz["conf"].astype(np.float32)
+    D = gr.from_np(dz["depth"]).float()
+    C = gr.from_np(dz["conf"]).float()
     pe = dz["pose_enc"]
     fy = (h / 2.0) / np.tan(pe[7] / 2.0)
     fx = (w / 2.0) / np.tan(pe[8] / 2.0)
-    src = np.asarray(Image.open(os.path.join(WORK, "frames", f"f{n:05d}.jpg"))
-                     .resize((w, h)), dtype=np.uint8)
-    left = np.asarray(Image.open(os.path.join(WORK, "frames", f"f{n:05d}.jpg"))
-                      .resize((PW, PH)), dtype=np.uint8)
-    good = C > CONF_MIN
-    X = (us - w / 2) / fx * D
-    Y = (vs - h / 2) / fy * D
-    zmid = float(np.median(D[good])) if good.any() else 1.0
-    u2, v2, zc = tilt_project(X[good], Y[good], D[good], zmid, fx, fy)
-    pc = gpu_splat(np.stack([u2, v2], 1), zc, src[good], PH, PW)
+    jt = gr.from_np(np.array(Image.open(os.path.join(WORK, "frames", f"f{n:05d}.jpg")),
+                             dtype=np.uint8))                # decode once, resize on GPU
+    src = gr.resize(jt, h, w)                                # cloud colors
+    left = gr.resize(jt, PH, PW)                             # top pane
+    pane, zmid = cloud_pane(D, C, src, float(fx), float(fy))
+    pc = gr.to_np(pane)
     if ok[n]:
         Jc = body_fix(J_cam[n], fx, fy)
         ju, jv, _ = tilt_project(Jc[:, 0], Jc[:, 1], Jc[:, 2], zmid, fx, fy)
-        pc = draw_skeleton(pc, np.stack([ju, jv], 1))
-    wr.write(np.concatenate([left, pc], 0))          # vertical stack: source / cloud
+        pc = skel_patch(pc, np.stack([ju, jv], 1))
+    wr.write(np.concatenate([gr.to_np(left), pc], 0))        # vertical stack: source / cloud
     if n % 1200 == 0:
         print(f"[poc] {n}/{N}", flush=True)
 wr.close()
