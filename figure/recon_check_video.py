@@ -11,16 +11,17 @@
 Usage: DEPTH_WORK=<pose_full dir> python figure/recon_check_video.py
 """
 import os
-
 import imageio.v2 as imageio
 import numpy as np
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from matplotlib import cm
 from PIL import Image
 
 WORK = os.environ["DEPTH_WORK"]
 _PKG = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(_PKG)
-OUTD = os.path.join(REPO, "outputs", "figure", "pose")
+OUTD = os.environ.get("MR_OUT", os.path.join(REPO, "outputs", "figure", "pose"))
 FPS = 24000 / 1001
 CONF_MIN = 1.2
 TILT = np.radians(float(os.environ.get("TILT_DEG", "33")))  # negative pitches the view downward
@@ -29,12 +30,15 @@ SKIP_DM = os.environ.get("SKIP_DM") == "1"
 # depth-map resolution (VGGT) and output pane
 d0 = np.load(os.path.join(WORK, "depth", "f00000.npz"))
 h, w = d0["depth"].shape
-SC = 960 / w                                             # 512x288 -> 960x540
+SC = min(960 / w, 1080 / h)                              # cap both dims (NVENC max 4096)
 PW, PH = int(w * SC) // 2 * 2, int(h * SC) // 2 * 2
+PORTRAIT = h > w                                         # portrait: stack panes horizontally
 
 # global depth range for stable colorization
 samp = []
-for k in range(0, 5189, 97):
+import glob as _g
+NALL = len(_g.glob(os.path.join(WORK, 'depth', 'f*.npz')))
+for k in range(0, NALL, max(1, NALL // 53)):
     f = os.path.join(WORK, "depth", f"f{k:05d}.npz")
     if os.path.exists(f):
         samp.append(np.load(f)["depth"].astype(np.float32).ravel()[::7])
@@ -45,11 +49,12 @@ TURBO = (np.asarray(cm.turbo(np.linspace(0, 1, 256)))[:, :3] * 255).astype(np.ui
 
 vs, us = np.mgrid[0:h, 0:w].astype(np.float32)
 
-wr_pc = imageio.get_writer(os.path.join(OUTD, "recon_points.mp4"), fps=FPS, quality=7,
-                           macro_block_size=1)
-wr_dm = imageio.get_writer(os.path.join(OUTD, "depth_maps.mp4"), fps=FPS, quality=7,
-                           macro_block_size=1)
-N = 5189
+from fastvid import VideoWriter  # noqa: E402
+AX = 1 if PORTRAIT else 0
+wr_pc = (VideoWriter(os.path.join(OUTD, "recon_points.mp4"), PW * 3, PH, FPS) if PORTRAIT
+         else VideoWriter(os.path.join(OUTD, "recon_points.mp4"), PW, PH * 3, FPS))
+wr_dm = VideoWriter(os.path.join(OUTD, "depth_maps.mp4"), PW * 2, PH, FPS)
+N = NALL
 for n in range(N):
     dz = np.load(os.path.join(WORK, "depth", f"f{n:05d}.npz"))
     D = dz["depth"].astype(np.float32)
@@ -84,7 +89,7 @@ for n in range(N):
         pc[vi, ui] = cc; pc[vi, ui + 1] = cc             # 2x2 splats close most gaps
         pc[vi + 1, ui] = cc; pc[vi + 1, ui + 1] = cc
         panes.append(pc)
-    wr_pc.append_data(np.concatenate(panes, 0))          # source / above / below
+    wr_pc.write(np.concatenate(panes, AX))               # source / above / below
 
     # ---- colorized depth map
     if SKIP_DM:
@@ -95,7 +100,7 @@ for n in range(N):
     dm = TURBO[idx]
     dm[~good] //= 4                                      # dim low-confidence regions
     dm = np.asarray(Image.fromarray(dm).resize((PW, PH), Image.NEAREST))
-    wr_dm.append_data(np.concatenate([left, dm], 1))
+    wr_dm.write(np.concatenate([left, dm], 1))
     if n % 1200 == 0:
         print(f"[check] {n}/{N}", flush=True)
 wr_pc.close(); wr_dm.close()

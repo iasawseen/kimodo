@@ -44,6 +44,8 @@ for n, key in enumerate(keys):
     if os.path.exists(out_path):
         continue
     img_path = os.path.join(WORK, "frames", key + ".png")
+    if not os.path.exists(img_path):
+        img_path = os.path.join(WORK, "frames", key + ".jpg")
     bbox = boxes[key][None].astype(np.float32)          # [1,4] xyxy
     outputs = estimator.process_one_image(img_path, bboxes=bbox, use_mask=False)
     if not outputs:

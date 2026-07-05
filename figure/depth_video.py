@@ -1,14 +1,25 @@
 #!/usr/bin/env python
 """Per-frame depth reconstruction of figure.mp4 with VGGT-Omega (facebookresearch/vggt-omega).
 
-Frames are processed in windows of S consecutive frames (one multi-view forward per window ->
-temporally consistent depth inside each window). Per frame we save the predicted depth map,
-its confidence, and the frame's camera pose encoding - everything needed to lift SAM-3D-Body
-2D keypoints into 3D (sample depth at kp2d, back-project with the VGGT camera).
+Frames are processed in LARGE OVERLAPPING windows (one multi-view forward per window). Each
+window is internally consistent; across windows VGGT renormalizes the scene (scale/shift), so
+consecutive windows are stitched by a robust affine fitted on the SHARED frames and blended
+linearly over the overlap. The result is one consistent depth normalization for the whole video
+- no window seams - and the stitching uses only shared-frame correspondence, so it works for
+moving cameras too (no static-scene assumption).
+
+Camera extrinsics are chained the same way: each window's per-frame poses live in that window's
+own coordinate frame (first frame ~ identity), so consecutive windows are aligned by a sim(3)
+estimated on the shared frames (rotation: SVD-averaged relative orientation; scale: the depth
+affine 'a'; translation: mean camera-center residual). Every frame gets cam_R/cam_T =
+camera-from-CHAIN extrinsics whose units match the stitched depth - this is what makes lifted
+skeletons world-consistent under a MOVING camera.
 
 Usage (env sam_3d_body, GPU 0):
     CUDA_VISIBLE_DEVICES=0 DEPTH_WORK=<workdir> python figure/depth_video.py <ckpt.pt>
-Outputs: <workdir>/depth/f%05d.npz  {depth[h,w] f16, conf[h,w] f16, pose_enc[9] f32}
+Env: VGGT_WINDOW (default 160; 192 fits in 24 GiB), VGGT_STRIDE (default 120).
+Outputs: <workdir>/depth/f%05d.npz  {depth[h,w] f16, conf[h,w] f16, pose_enc[9] f32,
+                                     cam_R[3,3] f32, cam_T[3] f32}
 """
 import glob
 import os
@@ -23,9 +34,12 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images  # noqa: E402
 
 WORK = os.environ["DEPTH_WORK"]
 CKPT = sys.argv[1]
-S = 16                                                       # frames per forward
+S = int(os.environ.get("VGGT_WINDOW", "160"))
+T = int(os.environ.get("VGGT_STRIDE", "120"))
+OV = S - T                                                   # overlap frames
 
 frames = sorted(glob.glob(os.path.join(WORK, "frames", "f*.jpg")))
+N = len(frames)
 outd = os.path.join(WORK, "depth")
 os.makedirs(outd, exist_ok=True)
 
@@ -34,25 +48,95 @@ state = torch.load(CKPT, map_location="cpu", weights_only=False)
 state = state.get("model", state) if isinstance(state, dict) else state
 model.load_state_dict(state)
 model = model.cuda()
+print(f"[depth] {N} frames, window={S} stride={T} overlap={OV}", flush=True)
 
-todo = [f for f in frames if not os.path.exists(
-    os.path.join(outd, os.path.basename(f)[:-4] + ".npz"))]
-print(f"[depth] {len(todo)}/{len(frames)} frames to process, window={S}", flush=True)
 
+def robust_affine(x, y):
+    keep = np.ones(len(x), bool)
+    a, b = 1.0, 0.0
+    for _ in range(3):
+        A = np.stack([x[keep], np.ones(keep.sum())], 1)
+        (a, b), *_ = np.linalg.lstsq(A, y[keep], rcond=None)
+        r = y - (a * x + b)
+        s_ = np.std(r[keep])
+        if s_ < 1e-6:
+            break
+        keep = np.abs(r) < 2.0 * s_
+    return float(a), float(b)
+
+
+def quat_to_mat(q):                                          # xyzw scalar-last (VGGT convention)
+    x, y, z, r = q
+    n = x * x + y * y + z * z + r * r
+    s = 0.0 if n < 1e-12 else 2.0 / n
+    return np.array([
+        [1 - s * (y * y + z * z), s * (x * y - z * r), s * (x * z + y * r)],
+        [s * (x * y + z * r), 1 - s * (x * x + z * z), s * (y * z - x * r)],
+        [s * (x * z - y * r), s * (y * z + x * r), 1 - s * (x * x + y * y)]])
+
+
+prev = {}                                                    # frame idx -> stitched depth (f32)
+prev_pose = {}                                               # frame idx -> (cam_R, cam_T) chained
+rng = np.random.default_rng(0)
 with torch.no_grad():
-    for w0 in range(0, len(todo), S):
-        batch_files = todo[w0:w0 + S]
-        images = load_and_preprocess_images(batch_files).cuda()
+    for w0 in range(0, N, T):
+        batch = frames[w0:w0 + S]
+        images = load_and_preprocess_images(batch).cuda()
         pred = model(images)
-        depth = pred["depth"][0].float().cpu().numpy()       # [S,h,w,1]
+        depth = pred["depth"][0].float().cpu().numpy()[..., 0]   # [B,h,w]
         conf = pred["depth_conf"][0].float().cpu().numpy()
-        pose = pred["pose_enc"][0].float().cpu().numpy()     # [S,9]
-        for i, f in enumerate(batch_files):
-            key = os.path.basename(f)[:-4]
-            np.savez_compressed(os.path.join(outd, key + ".npz"),
-                                depth=depth[i, :, :, 0].astype(np.float16),
-                                conf=conf[i].astype(np.float16),
-                                pose_enc=pose[i].astype(np.float32))
-        if (w0 // S) % 20 == 0:
-            print(f"[depth] {w0 + len(batch_files)}/{len(todo)}", flush=True)
+        pose = pred["pose_enc"][0].float().cpu().numpy()
+        del pred, images
+        R_new = [quat_to_mat(pose[k][3:7]) for k in range(len(batch))]  # cam-from-window-world
+        T_new = [pose[k][:3].astype(np.float64) for k in range(len(batch))]
+        # stitch to the running chain via the shared frames
+        shared = [i for i in range(w0, w0 + len(batch)) if i in prev]
+        if shared:
+            xs, ys = [], []
+            for i in shared:
+                d_new = depth[i - w0].ravel()
+                d_prev = prev[i].ravel()
+                sel = rng.choice(len(d_new), 4000, replace=False)
+                xs.append(d_new[sel]); ys.append(d_prev[sel])
+            a, b = robust_affine(np.concatenate(xs).astype(np.float64),
+                                 np.concatenate(ys).astype(np.float64))
+            # sim(3) window -> chain: p_chain = a * R_rel @ p_win + t_rel
+            # rotation: per shared frame R_rel(i) = R_chain_i^T @ R_new_i; SVD-average
+            M = np.zeros((3, 3))
+            for i in shared:
+                M += prev_pose[i][0].T @ R_new[i - w0]
+            U, _, Vt = np.linalg.svd(M)
+            R_rel = U @ Vt
+            if np.linalg.det(R_rel) < 0:
+                R_rel = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+            cen_chain = [-prev_pose[i][0].T @ prev_pose[i][1] for i in shared]
+            cen_new = [-R_new[i - w0].T @ T_new[i - w0] for i in shared]
+            t_rel = np.mean([cc - a * R_rel @ cn for cc, cn in zip(cen_chain, cen_new)], 0)
+        else:
+            a, b = 1.0, 0.0
+            R_rel, t_rel = np.eye(3), np.zeros(3)
+        depth = a * depth + b
+        # per-frame camera-from-chain: units of the corrected depth (scale folded into T)
+        R_ch = [R_new[k] @ R_rel.T for k in range(len(batch))]
+        T_ch = [a * T_new[k] - R_ch[k] @ t_rel for k in range(len(batch))]
+        # blend the overlap, write everything this window covers
+        prev_next = {}
+        prev_pose_next = {}
+        for k, i in enumerate(range(w0, w0 + len(batch))):
+            d = depth[k]
+            if i in prev:
+                wgt = (k + 1) / (OV + 1)                     # ramps toward the new window
+                d = (1.0 - wgt) * prev[i] + wgt * d
+            np.savez_compressed(os.path.join(outd, os.path.basename(frames[i])[:-4] + ".npz"),
+                                depth=d.astype(np.float16), conf=conf[k].astype(np.float16),
+                                pose_enc=pose[k].astype(np.float32),
+                                cam_R=R_ch[k].astype(np.float32), cam_T=T_ch[k].astype(np.float32))
+            if i >= w0 + T:                                  # will be shared with the next window
+                prev_next[i] = d.astype(np.float32)
+                prev_pose_next[i] = (R_ch[k], T_ch[k])
+        prev = prev_next
+        prev_pose = prev_pose_next
+        print(f"[depth] {min(w0 + S, N)}/{N}  a={a:.4f} b={b:+.4f}", flush=True)
+        if w0 + S >= N:
+            break
 print("DONE_DEPTH", flush=True)

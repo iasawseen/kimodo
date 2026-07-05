@@ -20,8 +20,18 @@ import sys
 import numpy as np
 
 WORK = os.environ["DEPTH_WORK"]
-FPS = 24000 / 1001
-W_IMG, H_IMG = 1280, 720                            # pose_full frame size (kp2d space)
+FPS = float(os.environ.get("MR_FPS", 24000 / 1001))
+T_MIN = float(os.environ.get("MR_TMIN", "4.0"))          # discard unreliable head of the video
+STAND0 = float(os.environ.get("MR_STAND0", "7.5"))       # upright-stance calibration window
+STAND1 = float(os.environ.get("MR_STAND1", "9.5"))
+YAW0 = float(os.environ.get("MR_YAW0", "8.0"))           # facing-anchor window (+X)
+YAW1 = float(os.environ.get("MR_YAW1", "13.5"))
+UP0 = float(os.environ.get("MR_UP0", "2.6"))             # torso-up estimation window
+UP1 = float(os.environ.get("MR_UP1", "9.5"))
+PELVIS_H = float(os.environ.get("MR_PELVIS_H", "0.72"))  # standing pelvis height (world units)
+from PIL import Image as _Image
+import glob as _glob
+W_IMG, H_IMG = _Image.open(sorted(_glob.glob(os.path.join(WORK, "frames", "f*.jpg")))[0]).size
 KP = {"nose": 0, "lsho": 5, "rsho": 6, "lelb": 7, "relb": 8, "lhip": 9, "rhip": 10,
       "lkne": 11, "rkne": 12, "lank": 13, "rank": 14, "lbtoe": 15, "lheel": 17,
       "rbtoe": 18, "rheel": 20, "rwri": 41, "lwri": 62, "neck": 69}
@@ -74,10 +84,18 @@ def main():
     d_body_raw = np.full(N, np.nan)
     djoint_raw = np.full((N, len(KIDX)), np.nan)
     tsec = np.zeros(N)
+    # per-frame camera-from-chain extrinsics (moving camera); identity when depth_video
+    # predates the pose chaining (static-camera runs like figure)
+    camR = np.tile(np.eye(3), (N, 1, 1))
+    camT = np.zeros((N, 3))
     for n, df in enumerate(dfiles):
         key = os.path.basename(df)[:-4]
         k = int(key[1:])
         tsec[n] = k / FPS
+        with np.load(df) as _dz:
+            if "cam_R" in _dz:
+                camR[n] = _dz["cam_R"].astype(np.float64)
+                camT[n] = _dz["cam_T"].astype(np.float64)
         mf = os.path.join(WORK, "mhr", key + ".npz")
         if not os.path.exists(mf):
             continue
@@ -116,6 +134,10 @@ def main():
             u, v = kp2d_all[n, j, 0] * su, kp2d_all[n, j, 1] * sv
             joints_cam[n, j] = [(u - cx) / fx * d, (v - cy) / fy * d, d]
 
+    # camera frame -> chain frame (one consistent frame across camera motion):
+    # p_chain = cam_R^T @ (p_cam - cam_T); identity for static-camera runs
+    joints_cam = np.einsum("nji,nkj->nki", camR, joints_cam - camT[:, None])
+
     # ---- gravity alignment: floor plane from robot-free title frames (dense unprojection)
     pts = []
     for k in range(0, 4):
@@ -130,12 +152,13 @@ def main():
         d = D[::4, ::4]
         c = C[::4, ::4]
         m = c > 2.0
-        pts.append(np.stack([(us[m] - cx) / fx * d[m], (vs[m] - cy) / fy * d[m], d[m]], 1))
+        pc = np.stack([(us[m] - cx) / fx * d[m], (vs[m] - cy) / fy * d[m], d[m]], 1)
+        pts.append((pc - camT[k]) @ camR[k])             # into the chain frame
     P = np.concatenate(pts, 0)
     # UP from the robot itself: the walking/standing torso is the most reliable plumb line here
     # (VGGT depth on the textureless floor is bowed - a floor-plane normal came out ~30 deg off,
     # measured by the standing robot's torso). Floor points only set the height offset below.
-    upr = (tsec >= 2.6) & (tsec <= 9.5)
+    upr = (tsec >= UP0) & (tsec <= UP1)
     tor = joints_cam[upr, KIDX.index(KP["neck"])] - 0.5 * (
         joints_cam[upr, KIDX.index(KP["lhip"])] + joints_cam[upr, KIDX.index(KP["rhip"])])
     tor = tor[np.isfinite(tor[:, 0])]
@@ -150,7 +173,7 @@ def main():
     Jw = np.einsum("ij,nkj->nki", R, joints_cam)
     # floor + scale from the ROBOT itself (scene-histogram peaks proved unreliable):
     # feet touch the floor while standing, and the standing pelvis height is known
-    stand = (tsec >= 7.5) & (tsec <= 9.5)
+    stand = (tsec >= STAND0) & (tsec <= STAND1)
     heels = Jw[stand][:, [KIDX.index(KP["lheel"]), KIDX.index(KP["rheel"])], 2]
     zfloor = float(np.nanmedian(heels))
     pelv_z = float(np.nanmedian(0.5 * (Jw[stand, KIDX.index(KP["lhip"]), 2]
@@ -162,7 +185,7 @@ def main():
     Pw = P @ R.T
     Pw[:, 2] -= zfloor
     cam_h = -zfloor
-    scale = 0.72 / (pelv_z - zfloor)
+    scale = PELVIS_H / (pelv_z - zfloor)
     Jw *= scale
     Pw *= scale
     print(f"[lift] stand pelvis raw {pelv_z - zfloor:.3f} -> scale {scale:.2f}, "
@@ -171,7 +194,7 @@ def main():
     # kitchen frame: +X = the robot's facing during dishwasher work (median hip-line x up)
     names = list(KP)
     hipv = Jw[:, names.index("lhip")] - Jw[:, names.index("rhip")]
-    work = (tsec >= 8.0) & (tsec <= 13.5)
+    work = (tsec >= YAW0) & (tsec <= YAW1)
     hv = hipv[work]
     hv = hv[np.isfinite(hv[:, 0])]
     hmed = np.median(hv, 0); hmed[2] = 0.0
@@ -183,12 +206,14 @@ def main():
     Jw = np.einsum("ij,nkj->nki", Rz, Jw)
     Pw = Pw @ Rz.T
     ok = np.isfinite(Jw[:, :, 0]).all(1)
-    ok &= tsec >= 4.0                                    # first 4 s: robot absent/partial,
-                                                         # SAM-3D results discarded
-    # camera in the same frame (needed by the kitchen fit / camera solve):
-    # world(p_cam) = Rz @ (scale * (R @ p_cam - [0,0,(R@a0)_z]))
-    cam_pos_w = Rz @ np.array([0.0, 0.0, -zfloor * scale])
-    Rcw = Rz @ R                                         # camera-basis rows in world coords
+    ok &= tsec >= T_MIN                                  # unreliable head discarded
+    # camera in the same frame (needed by the kitchen fit / camera solve). With per-frame
+    # chained extrinsics: world(p_cam, n) = M_c2w[n] @ p_cam + c_c2w[n]
+    # where the static part is world(p_chain) = Rz @ (scale * (R @ p_chain - [0,0,zfloor])).
+    Rcw = Rz @ R                                         # chain-basis rows in world coords
+    M_c2w = scale * np.einsum("ij,njk->nik", Rcw, np.transpose(camR, (0, 2, 1)))
+    c_c2w = -np.einsum("nij,nj->ni", M_c2w, camT) - np.array([0.0, 0.0, zfloor * scale])
+    cam_pos_w = np.median(c_c2w, 0)                      # legacy static key (exact when static)
     fovs = []
     for k in range(0, 40):
         df = os.path.join(WORK, "depth", f"f{k:05d}.npz")
@@ -198,8 +223,10 @@ def main():
                         joints_w=Jw.astype(np.float32), t=tsec, ok=ok,
                         scene=Pw[::3].astype(np.float32),
                         cam_pos=cam_pos_w.astype(np.float64), R_cam2world=Rcw.astype(np.float64),
-                        scale=np.float64(scale), fov_h=np.float64(np.median(fovs)))
-    print(f"[lift] {ok.sum()}/{N} frames lifted; cam at {cam_pos_w.round(2)}")
+                        scale=np.float64(scale), fov_h=np.float64(np.median(fovs)),
+                        M_c2w=M_c2w.astype(np.float64), c_c2w=c_c2w.astype(np.float64))
+    print(f"[lift] {ok.sum()}/{N} frames lifted; cam at {cam_pos_w.round(2)}, "
+          f"cam travel {np.linalg.norm(c_c2w - c_c2w[0], axis=1).max():.2f}u")
 
     # ---- bird's-eye view
     import matplotlib

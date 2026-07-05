@@ -17,12 +17,13 @@ from PIL import Image, ImageDraw
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from skel_draw import draw_skeleton, draw_trail  # noqa: E402
+from fastvid import VideoWriter  # noqa: E402
 
 WORK = os.environ["DEPTH_WORK"]
 _PKG = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(_PKG)
 OUTP = os.environ.get("BEV_OUT", os.path.join(REPO, "outputs", "figure", "pose", "birdseye.mp4"))
-FPS = 24000 / 1001
+FPS = float(os.environ.get("MR_FPS", 24000 / 1001))
 
 z = np.load(os.environ.get("POSE_NPZ", os.path.join(WORK, "lift3d.npz")))
 J, t, ok, P = z["joints_w"], z["t"], z["ok"], z["scene"]
@@ -64,7 +65,10 @@ BG = np.asarray(bg)
 
 mid = 0.5 * (J[:, I["lhip"], :2] + J[:, I["rhip"], :2])
 N = len(t)
-wr = imageio.get_writer(OUTP, fps=FPS, quality=7, macro_block_size=1)
+from PIL import Image as _I
+_s0 = _I.open(os.path.join(WORK, "frames", "f00000.jpg")).size
+_srch = 2 * ((W * _s0[1] // _s0[0]) // 2)
+wr = VideoWriter(OUTP, W, H + _srch, FPS)
 for n in range(N):
     bev = BG.copy()
     tr = [px(mid[k]) for k in range(0, n + 1, 3) if ok[k]]
@@ -76,8 +80,9 @@ for n in range(N):
     ImageDraw.Draw(frame).text((12, 10), f"t = {t[n]:6.2f} s", fill=(250, 250, 250))
     bev = np.asarray(frame)
     # top pane: source frame, same width as the BEV; vertical stack
-    src = Image.open(os.path.join(WORK, "frames", f"f{n:05d}.jpg")).resize((W, 2 * ((W * 9 // 16) // 2)))
-    wr.append_data(np.concatenate([np.asarray(src), bev], 0))
+    src = Image.open(os.path.join(WORK, "frames", f"f{n:05d}.jpg"))
+    src = src.resize((W, 2 * ((W * src.size[1] // src.size[0]) // 2)))
+    wr.write(np.concatenate([np.asarray(src), bev], 0))
     if n % 1200 == 0:
         print(f"[bev] {n}/{N}", flush=True)
 wr.close()
