@@ -1,0 +1,33 @@
+# Perception container: SAM-3D-Body + VGGT-Omega inference (MotionRecon front half).
+# The two model repos are NOT baked in - they are volume-mounted at /work/sam-3d-body and
+# /work/vggt-omega (figure/* scripts resolve them relative to the repo mount, same as on host).
+# Build from the REPO ROOT context:  docker compose -f docker/compose.yaml build percept
+FROM nvcr.io/nvidia/pytorch:24.10-py3
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /work/kimodo
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates ffmpeg libgl1 libglib2.0-0 gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Inference-only dependency set:
+#  - sam-3d-body (per INSTALL.md, minus detector/training/dev extras: detectron2 is bypassed
+#    with manual bboxes, MoGe/pyrender/wandb unused for inference)
+#  - vggt-omega (requirements.txt: einops, safetensors, Pillow, opencv, numpy<2)
+#  - our pipeline: modelscope (gated-checkpoint mirror), imageio+ffmpeg, matplotlib
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+ && python -m pip install \
+      pytorch-lightning opencv-python-headless yacs scikit-image einops timm dill pandas \
+      hydra-core pyrootutils roma joblib loguru optree fvcore pycocotools xtcocotools \
+      huggingface_hub decord psutil safetensors "numpy<2" \
+      modelscope imageio imageio-ffmpeg matplotlib
+
+ENV PYTHONPATH=/work/kimodo
+
+CMD ["bash"]

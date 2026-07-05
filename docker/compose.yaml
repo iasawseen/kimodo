@@ -1,0 +1,65 @@
+# MotionRecon / figure-pipeline work containers.
+#   build:  docker compose -f docker/compose.yaml build
+#   gen:    docker compose -f docker/compose.yaml run --rm gen \
+#             python -m figure.gen_helix_kitchen walk_in
+#   percept:docker compose -f docker/compose.yaml run --rm percept \
+#             bash -c 'DEPTH_WORK=/scratch/pose_x python figure/depth_video.py <ckpt>'
+# GPU split mirrors the host convention: gen -> GPU 0, percept -> GPU 1.
+services:
+  gen:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gen
+    image: kimodo-gen:latest
+    working_dir: /work/kimodo
+    volumes:
+      - ..:/work/kimodo
+      - ${HOME}/.cache/kimodo:/root/.cache/kimodo
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${SCRATCH_DIR:-/tmp/kimodo-scratch}:/scratch
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - TEXT_ENCODERS_DIR=/root/.cache/kimodo/text_encoders
+      - HF_HOME=/root/.cache/kimodo/text_encoders/hf_home
+      - MUJOCO_GL=egl
+      - PYTHONPATH=/work/kimodo
+      - NVIDIA_VISIBLE_DEVICES=all
+      # graphics -> EGL rendering, video -> NVENC encoding
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,video
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  percept:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.percept
+    image: kimodo-percept:latest
+    working_dir: /work/kimodo
+    volumes:
+      - ..:/work/kimodo
+      - ../../sam-3d-body:/work/sam-3d-body:ro
+      - ../../vggt-omega:/work/vggt-omega:ro
+      - ${HOME}/.cache/modelscope:/root/.cache/modelscope
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${SCRATCH_DIR:-/tmp/kimodo-scratch}:/scratch
+    environment:
+      - CUDA_VISIBLE_DEVICES=1
+      - PYTHONPATH=/work/kimodo
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
