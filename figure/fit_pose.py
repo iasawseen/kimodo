@@ -25,8 +25,11 @@ WORK = os.environ["DEPTH_WORK"]
 _PKG = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(_PKG)
 OUTD = os.path.join(REPO, "outputs", "figure", "pose")
-FPS = 24000 / 1001
-W_IMG, H_IMG = 1280, 720                            # pose_full frame size (kp2d space)
+FPS = float(os.environ.get("MR_FPS", 24000 / 1001))
+T_MIN = float(os.environ.get("MR_TMIN", "4.0"))
+from PIL import Image as _Image
+import glob as _glob
+W_IMG, H_IMG = _Image.open(sorted(_glob.glob(os.path.join(WORK, "frames", "f*.jpg")))[0]).size
 CONF_MIN = 1.1
 
 KP = {"nose": 0, "lsho": 5, "rsho": 6, "lelb": 7, "relb": 8, "lhip": 9, "rhip": 10,
@@ -99,6 +102,8 @@ def main():
         cams[n] = (fx, fy)
         mz = np.load(mf)
         kp2d = mz["kp2d"]
+        if np.ptp(kp2d[:, 1]) > 1.5 * H_IMG or np.ptp(kp2d[:, 0]) > 1.5 * W_IMG:
+            continue                                     # degenerate SAM frame (e.g. figure f05188)
         Zs = (mz["kp3d"] + mz["cam_t"][None])[:, 2]      # SAM camera-frame joint depths (m)
         su, sv = w / W_IMG, h / H_IMG
         uv = np.stack([kp2d[KIDX, 0] * su, kp2d[KIDX, 1] * sv], 1)
@@ -171,7 +176,7 @@ def main():
     r_s = np.array([np.median(r_i[max(0, i - pr):i + pr + 1]) for i in idx])
 
     # rigid re-lift: pelvis on its ray at the body depth; joints = ratio-scaled SAM offsets
-    z = np.load(os.path.join(OUTD, "lift3d.npz"))
+    z = np.load(os.path.join(os.environ.get("MR_OUT", OUTD), "lift3d.npz"))
     Rcw, scale, cam_pos = z["R_cam2world"], float(z["scale"]), z["cam_pos"]
     h, w = np.load(dfiles[0])["depth"].shape
     Jc = np.full((N, len(KIDX), 3), np.nan)
@@ -183,12 +188,36 @@ def main():
         pelv = np.array([(up[0] - w / 2) / fx * d_s[n], (up[1] - h / 2) / fy * d_s[n], d_s[n]])
         Jc[n] = pelv[None] + r_s[n] * rel_all[n]
     a_s, b_s = r_s, d_s                                  # kept in the npz for inspection
-    # temporal smoothing of the assembled motion: per joint/coord, median (kills single-frame
-    # SAM spikes/flips) then a short moving average (~0.4 s) - keeps walking/reaching dynamics,
-    # removes frame-to-frame jitter
+    # camera -> world: per-frame affine when the camera moves (M_c2w from the chained VGGT
+    # extrinsics), the static legacy map otherwise
+    if "M_c2w" in z:
+        Jw = np.einsum("nij,nkj->nki", z["M_c2w"], Jc) + z["c_c2w"][:, None]
+    else:
+        Jw = scale * np.einsum("ij,nkj->nki", Rcw, Jc) + cam_pos[None, None]
+    # body-size calibration from the subject: the pelvis rides the depth ray (height is right
+    # by construction), but the OFFSETS are sized by SAM's absolute depth, which wobbles.
+    # During the stand window the heels must touch the floor -> uniform rescale about mid-hip.
+    st0 = float(os.environ.get("MR_STAND0", "7.5"))
+    st1 = float(os.environ.get("MR_STAND1", "9.5"))
+    midw = 0.5 * (Jw[:, LH] + Jw[:, RH])
+    m_st = (tsec >= st0) & (tsec <= st1) & np.isfinite(Jw[:, :, 2]).all(1)
+    kappa = 1.0
+    if m_st.sum() >= 3:
+        pelv_z = np.median(midw[m_st, 2])
+        heel_z = np.median(0.5 * (Jw[m_st, KPN.index("lheel"), 2]
+                                  + Jw[m_st, KPN.index("rheel"), 2]))
+        kappa = pelv_z / max(pelv_z - heel_z, 1e-6)
+        if 0.5 < kappa < 2.0:
+            Jw = midw[:, None] + kappa * (Jw - midw[:, None])
+            print(f"[fit] body-size calib: heel z {heel_z:+.3f} -> kappa {kappa:.3f}")
+        else:
+            kappa = 1.0
+    # temporal smoothing of the assembled motion, in WORLD space (camera motion must not leak
+    # into the joints): per joint/coord, median (kills single-frame SAM spikes/flips) then a
+    # short moving average (~0.4 s) - keeps walking/reaching dynamics, removes jitter
     from numpy.lib.stride_tricks import sliding_window_view
     idx = np.arange(N)
-    flat = Jc.reshape(N, -1)
+    flat = Jw.reshape(N, -1)
     for c in range(flat.shape[1]):
         v = flat[:, c]
         m = np.isfinite(v)
@@ -200,11 +229,12 @@ def main():
             wins = sliding_window_view(pad, kk)
             vi = np.median(wins, 1) if op == "med" else wins.mean(1)
         v[m] = vi[m]                                     # keep gaps invalid
-    Jw = scale * np.einsum("ij,nkj->nki", Rcw, Jc) + cam_pos[None, None]
     ok = np.isfinite(Jw[:, :, 0]).all(1)
-    ok &= tsec >= 4.0                                    # first 4 s: SAM-3D discarded
-    np.savez_compressed(os.path.join(OUTD, "fit3d.npz"),
-                        joints_w=Jw.astype(np.float32), t=tsec, ok=ok,
+    ok &= tsec >= T_MIN                                  # unreliable head discarded
+    # kappa is a WORLD-space calibration; overlay renderers that reproject joints_w against the
+    # video must divide the mid-hip-relative offsets by it (see collate_video / pose_over_cloud)
+    np.savez_compressed(os.path.join(os.environ.get("MR_OUT", OUTD), "fit3d.npz"),
+                        joints_w=Jw.astype(np.float32), t=tsec, ok=ok, kappa=np.float32(kappa),
                         a=a_s, b=b_s, npix=npix, scene=z["scene"], cam_pos=cam_pos)
     print(f"[fit] {ok.sum()}/{N} frames -> fit3d.npz")
 

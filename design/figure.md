@@ -204,10 +204,21 @@ figure.mp4 (1280x720 frames, 23.976 fps)
 
 ### 7.2 VGGT-Omega (github.com/facebookresearch/vggt-omega)
 
-- `vggt_omega_1b_512.pt` via ModelScope (HF gated). Feed-forward; frames processed in
-  **16-frame windows** (`depth_video.py`), saving `depth`/`conf` (float16) + 9-dof `pose_enc`
-  (decode: `encoding_to_camera` — fov_h/fov_w → intrinsics). Static camera ⇒ each window's world
-  frame ≈ the camera frame.
+- `vggt_omega_1b_512.pt` via ModelScope (HF gated). Feed-forward; frames processed in **large
+  overlapping windows** (`depth_video.py`, default 160-frame window / 120 stride; 192 frames fit
+  in 24 GiB). Consecutive windows are renormalized by VGGT, so the chain is stitched on the
+  **shared frames**: robust affine `d ← a·d + b` on subsampled shared-frame depths, then linear
+  blend across the 40-frame overlap. This removed the window seams at the source (naive-lift
+  pelvis steps: uniform 0.5 cm, no seam spikes) and needs no static-scene assumption.
+- **Camera extrinsics are chained the same way** (per-frame `cam_R`/`cam_T` =
+  camera-from-chain, saved in each depth npz): each window's `pose_enc` poses live in that
+  window's own frame, so the window→chain sim(3) is estimated from the shared frames (rotation:
+  SVD-averaged relative orientation; scale: the depth affine `a`; translation: mean
+  camera-center residual). This is what makes lifted skeletons world-consistent under a
+  **moving camera** (vera: measured camera travel 1.5 u — a static-camera assumption put all of
+  that into the skeleton trajectory).
+- Saves `depth`/`conf` (float16) + 9-dof `pose_enc` (decode: `encoding_to_camera` — fov_h/fov_w
+  → intrinsics; quaternion is xyzw scalar-last).
 - **What it's good for** (verified with `recon_check_video.py` — identity re-render + ±33°
   parallax views + colorized depth maps): per-frame relative structure — depth ordering,
   occlusion boundaries, planarity, temporal stability. `fovy ≈ 30°` from `pose_enc` fixed the
@@ -220,8 +231,9 @@ figure.mp4 (1280x720 frames, 23.976 fps)
     joints) ≈ 0.24; a per-frame affine depth fit flips sign frame to frame even with a planar
     bias field. Per-joint depth reads are unrecoverable — only **one body-level depth per
     frame** is usable;
-  - **per-window scale/shift drift**: pelvis jumps of ~3.3 cm at every 16-frame seam in the
-    naive lift.
+  - **per-window scale/shift drift**: pelvis jumps of ~3.3 cm at every window seam in the naive
+    lift before the overlap stitching (historical 16-frame-window runs; the overlap stitch
+    removed them).
 
 ### 7.3 Alignment + naive lift (`lift_skeleton.py` → `lift3d.npz`)
 
@@ -238,6 +250,17 @@ replaced a scene-derived estimate that measurably failed:
   same ~90° ambiguity as the anchor yaws — consumers that need direction use chord alignment).
 - Naive per-keypoint lift (kp2d ray × depth sample) is kept as the baseline: silhouette
   keypoints bleed onto background depth → bone-length scatter 14–82 %.
+- **Moving camera**: joints are first mapped camera→chain via the per-frame `cam_R`/`cam_T`
+  (identity fallback for pre-chaining depth caches), and all calibrations run in the chain
+  frame. `lift3d.npz` carries per-frame affine world maps `M_c2w [N,3,3]` / `c_c2w [N,3]`
+  (`world(p_cam, n) = M_n p + c_n`; `c_n` is the camera center); the static keys
+  (`R_cam2world`, `cam_pos`, `scale`) remain for static-camera consumers.
+- **Scenario parameters are env vars** (`MR_FPS`, `MR_TMIN`, `MR_STAND0/1`, `MR_YAW0/1`,
+  `MR_UP0/1`, `MR_PELVIS_H`, `MR_OUT`); frame size is auto-detected from `frames/f00000.jpg`
+  (portrait phone video works — extraction must respect rotation metadata, e.g. `scale=720:1280`
+  for a rotate-90 4K source). Calibration windows must sample **upright** phases: on vera the
+  windows initially covered a shelf-crouch, which tilted the torso-up axis and shrank the
+  floor/scale estimates.
 
 ### 7.4 Rigid fitter (`fit_pose.py` → `fit3d.npz`)
 
@@ -250,14 +273,24 @@ the cloud contributes exactly one number per frame** — a robust body depth:
 - pelvis rides its kp2d ray at that depth; all other joints are SAM kp3d offsets from mid-hip,
   scaled by the (heavily smoothed) raw-per-meter ratio → **bone lengths constant by
   construction**;
-- results: bone scatter 20–79 % → **4–6 %** (SAM's own floor), pelvis seam jumps 3.3 → 1.4 cm.
+- **body-size calibration from the subject**: the pelvis height is right by construction (ray ×
+  calibrated depth), but the offset sizes inherit **SAM's absolute depth**, which is the
+  flakiest number in the stack — the fitted body comes out uniformly small (figure: heels
+  floated +0.15 above the floor, κ=1.26; vera: +0.28, κ=1.42). Fix: uniform rescale about
+  mid-hip so stand-window heels land on z=0 (`MR_STAND0/1`). After it, heels ≈ 0 in every phase
+  (walk / stand / crouch) with pelvis height preserved. **κ is persisted in `fit3d.npz`** — it
+  is a *world-space-only* calibration; anything that reprojects `joints_w` back onto the video
+  must divide it out (§7.7);
+- degenerate SAM frames (kp2d span > 1.5× frame size, e.g. figure f05188) are skipped at load;
+- results: bone scatter 20–79 % → **4–6 %** on the robot, 1–2 % on a human (SAM's native
+  domain); pelvis steps 0.2 cm with no seam signature.
 
 ### 7.5 Smoother
 
-Per joint/coordinate in camera frame, before the world transform: **7-frame median** (kills
-single-frame SAM spikes/flips) + **11-frame moving average** (~0.45 s). Walking/reaching
-dynamics survive; work-phase pelvis steps drop to 0.3 cm within windows, **0.4 cm across seams**
-(seam artifact below natural motion level).
+Per joint/coordinate in **world space**, after the per-frame world transform (in camera space a
+moving camera's shake would leak into the joints): **7-frame median** (kills single-frame SAM
+spikes/flips) + **11-frame moving average** (~0.45 s). Walking/reaching dynamics survive;
+work-phase pelvis steps drop to 0.3 cm within windows, seam artifact below natural motion level.
 
 ### 7.6 Consumers + limits
 
@@ -270,8 +303,44 @@ dynamics survive; work-phase pelvis steps drop to 0.3 cm within windows, **0.4 c
   el/height) — baked into `build_scene.py`.
 - Visualizations (all source-synced; `skel_draw.py` styling — L cyan / R orange / spine mint,
   supersampled): `birdseye_fit.mp4` (BEV + fading trail), `pose_over_cloud.mp4` (+33° cloud +
-  skeleton), `recon_points.mp4` / `depth_maps.mp4` (recon QA), `collate.mp4` (2×2:
-  raw / depth / points+33° / BEV).
+  skeleton), `recon_points.mp4` / `depth_maps.mp4` (recon QA), `collate_video.py` — one-pass
+  composition straight from the cached assets with the fitted skeleton reprojected on the raw
+  pane (2×2 grid for landscape sources / 1×4 row for portrait, `LAYOUT=grid|row`). Rendering is
+  GPU-fast (`fastvid.py`: NVENC writer + torch splats) and **worker-parallel** (`WORKERS=8`
+  chunks concatenated via `-c copy`; figure collate 14 min → ~2 min). NVENC caps frames at
+  4096 px per side — portrait pane stacks must go horizontal.
 - Honest limits: absolute trajectory depth is ±0.3 m-class (both estimators weak, corr 0.31 —
   keep chord alignment); the entry walk is under-measured; SAM per-frame scale wobble survives
   smoothing at low frequency.
+
+### 7.7 Reprojecting `fit3d` onto the video — the scale invariant
+
+Diagnosed from "the overlay skeleton is shorter than the subject" (mild on figure, prominent on
+vera_short). The on-screen size of the reprojected skeleton factorizes **exactly** as
+
+```
+overlay / kp2d = κ × (f_vggt / f_sam)
+```
+
+with the mid-hip pinned to the subject (the pelvis rides its kp2d ray, so its pixel is exact to
+~1 px and the error appears as feet floating / head sitting low — which reads as "shorter").
+
+- **What cancels and can never cause it**: the `MR_PELVIS_H` lift scale is baked into
+  `M_c2w`/`c_c2w` and exactly inverted by every renderer's world→camera map — changing it cannot
+  fix or break the overlay. Pixel-space mismatch was also refuted (processed frames = raw video
+  size in both scenarios).
+- **What does not cancel** (both fixed in `collate_video.py` + `pose_over_cloud.py` via
+  `body_fix()` — a rescale about the camera-frame mid-hip by `f_sam·(w/FW) / √(fx·fy) / κ`):
+  1. **Focal substitution**: the fitted offsets subtend **SAM's angular sizes** (`r_s = d_s /
+     z_sam` construction, §7.4), pixel-correct only under SAM's fixed heuristic focal
+     (**1468.6 px**, recovered from the caches at 0.00 px residual) — but the renderers project
+     with **VGGT's `pose_enc` focal**. `f_vggt/f_sam`: figure **0.910**, vera_short **0.619** —
+     this single ratio was the mild-vs-prominent axis.
+  2. **κ** (§7.4): legitimate in world space (BEV, gait metrics — do NOT undo it there), but it
+     rides into the reprojection un-inverted (figure ×1.256, vera_short ×1.418; recovered for
+     pre-existing `fit3d.npz` from world-vs-SAM bone lengths and stamped in).
+- Measured overlay/kp2d span after the fix: figure 1.15 → **1.01**, vera_short 0.87 → **0.99**
+  (residual = smoothing wobble).
+- **Irreducible residual**: MHR-70 has no head-top keypoint — the skeleton tops at the nose, so
+  it under-covers the subject's silhouette by construction (figure: kp2d spans 0.71 of the
+  detector bbox). Cosmetic, not a scale error; extrapolate a head-top point if it matters.
