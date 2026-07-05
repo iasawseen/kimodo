@@ -159,7 +159,8 @@ def render_frame(n):
     tr = [bpx(mid_w[k]) for k in range(0, n + 1, 3) if ok[k]]
     bev = draw_trail(bev, tr)
     if ok[n]:
-        bev = draw_skeleton(bev, np.array([bpx(J_w[n, i, :2]) for i in range(len(KPN))]),
+        bev = draw_skeleton(bev, np.array([bpx(J_w[n, i, :2])                # body only: hands
+                                           for i in range(min(18, J_w.shape[1]))]),  # are sub-px in BEV
                             scale=H / 1080 + 0.3)
     if LAYOUT == "row":
         return np.concatenate([raw, dm, pts, bev], 1)

@@ -9,6 +9,12 @@ from PIL import Image, ImageDraw
 
 KPN = ["nose", "lsho", "rsho", "lelb", "relb", "lhip", "rhip", "lkne", "rkne",
        "lank", "rank", "lbtoe", "lheel", "rbtoe", "rheel", "rwri", "lwri", "neck"]
+# hands appended AFTER the body 18 (same order as fit_pose.KP): 5 fingers x 4 joints per hand,
+# finger chains tip->proximal. Older 18-joint fit3d files simply have no hand rows to draw.
+for _side in ("r", "l"):
+    for _fn in ("th", "ix", "md", "rg", "pk"):
+        for _jn in ("tip", "dst", "mid", "prx"):
+            KPN.append(f"{_side}_{_fn}_{_jn}")
 I = {n: i for i, n in enumerate(KPN)}
 
 C_L = (60, 190, 255)          # left limbs
@@ -25,23 +31,35 @@ BONES = [("neck", "nose", C_C, 4), ("lsho", "rsho", C_C, 5),
          ("rsho", "relb", C_R, 4), ("relb", "rwri", C_R, 4),
          ("rhip", "rkne", C_R, 5), ("rkne", "rank", C_R, 4),
          ("rank", "rheel", C_R, 3), ("rheel", "rbtoe", C_R, 3)]
+for _side, _w, _c in (("r", "rwri", C_R), ("l", "lwri", C_L)):
+    for _fn in ("th", "ix", "md", "rg", "pk"):
+        BONES += [(_w, f"{_side}_{_fn}_prx", _c, 2),
+                  (f"{_side}_{_fn}_prx", f"{_side}_{_fn}_mid", _c, 2),
+                  (f"{_side}_{_fn}_mid", f"{_side}_{_fn}_dst", _c, 2),
+                  (f"{_side}_{_fn}_dst", f"{_side}_{_fn}_tip", _c, 2)]
 
 
 def draw_skeleton(img_arr, pts, scale=1.0, alpha=235):
-    """Composite a pretty skeleton onto img_arr (H,W,3 uint8). pts: [18,2] pixel coords."""
+    """Composite a pretty skeleton onto img_arr (H,W,3 uint8). pts: [K,2] pixel coords in KPN
+    order; K may be 18 (body-only, older fit3d) or 58 (body + hands) - missing rows are skipped."""
     H, W = img_arr.shape[:2]
     S = 2
     ov = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
     d = ImageDraw.Draw(ov)
     p = np.asarray(pts, dtype=np.float64) * S
+    K = len(p)
     ws = scale * S
     # dark underlay first (all bones), then color pass
     for a, b, col, w in BONES:
+        if I[a] >= K or I[b] >= K:
+            continue
         pa, pb = p[I[a]], p[I[b]]
         if not (np.isfinite(pa).all() and np.isfinite(pb).all()):
             continue
         d.line([tuple(pa), tuple(pb)], fill=(10, 12, 16, 220), width=int((w + 3) * ws))
     for a, b, col, w in BONES:
+        if I[a] >= K or I[b] >= K:
+            continue
         pa, pb = p[I[a]], p[I[b]]
         if not (np.isfinite(pa).all() and np.isfinite(pb).all()):
             continue
@@ -49,8 +67,10 @@ def draw_skeleton(img_arr, pts, scale=1.0, alpha=235):
         for q in (pa, pb):
             r = 0.5 * w * ws
             d.ellipse([q[0] - r, q[1] - r, q[0] + r, q[1] + r], fill=(*col, alpha))
-    # joints: dark ring + light core
-    for k in range(len(KPN)):
+    # joints: dark ring + light core (fingers: bone strokes only, no dots - too cluttered)
+    for k in range(min(K, len(KPN))):
+        if "_" in KPN[k]:                    # finger joints (body names have no underscore)
+            continue
         q = p[k]
         if not np.isfinite(q).all():
             continue

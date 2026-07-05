@@ -35,8 +35,21 @@ CONF_MIN = 1.1
 KP = {"nose": 0, "lsho": 5, "rsho": 6, "lelb": 7, "relb": 8, "lhip": 9, "rhip": 10,
       "lkne": 11, "rkne": 12, "lank": 13, "rank": 14, "lbtoe": 15, "lheel": 17,
       "rbtoe": 18, "rheel": 20, "rwri": 41, "lwri": 62, "neck": 69}
+# MHR-70 hands: 5 fingers x 4 joints per hand, each finger chain ordered TIP->proximal
+# (verified empirically: distances from the wrist decrease within each 4-block).
+# Right hand block 21-40 (wrist 41), left hand block 42-61 (wrist 62).
+for _side, _base in (("r", 21), ("l", 42)):
+    for _f, _fn in enumerate(("th", "ix", "md", "rg", "pk")):        # thumb..pinky
+        for _j, _jn in enumerate(("tip", "dst", "mid", "prx")):      # tip -> proximal
+            KP[f"{_side}_{_fn}_{_jn}"] = _base + 4 * _f + _j
 KPN = list(KP)
 KIDX = list(KP.values())
+# finger bone chains: wrist -> prx -> mid -> dst -> tip
+HAND_BONES = []
+for _side, _w in (("r", "rwri"), ("l", "lwri")):
+    for _fn in ("th", "ix", "md", "rg", "pk"):
+        HAND_BONES += [(_w, f"{_side}_{_fn}_prx"), (f"{_side}_{_fn}_prx", f"{_side}_{_fn}_mid"),
+                       (f"{_side}_{_fn}_mid", f"{_side}_{_fn}_dst"), (f"{_side}_{_fn}_dst", f"{_side}_{_fn}_tip")]
 # tube bones with part radii (meters, SAM metric): surface sits ~radius in front of the axis
 TUBE = [("lhip", "rhip", 0.10), ("neck", "lhip", 0.11), ("neck", "rhip", 0.11),
         ("neck", "nose", 0.09), ("lsho", "rsho", 0.09),
