@@ -37,12 +37,20 @@ estimator = SAM3DBodyEstimator(sam_3d_body_model=model, model_cfg=model_cfg)
 boxes = np.load(os.path.join(WORK, "boxes.npz"))
 os.makedirs(os.path.join(WORK, "mhr"), exist_ok=True)
 os.makedirs(os.path.join(WORK, "overlay"), exist_ok=True)
+np.save(os.path.join(WORK, "mhr", "faces.npy"), estimator.faces)   # constant mesh topology
+FORCE = os.environ.get("PV_FORCE", "0") == "1"          # re-run frames that lack the new keys
 
 keys = sorted(boxes.files)
 for n, key in enumerate(keys):
     out_path = os.path.join(WORK, "mhr", key + ".npz")
     if os.path.exists(out_path):
-        continue
+        if not FORCE:
+            continue
+        try:                                            # idempotent force: skip if already upgraded
+            if "verts" in np.load(out_path).files:
+                continue
+        except Exception:
+            pass
     img_path = os.path.join(WORK, "frames", key + ".png")
     if not os.path.exists(img_path):
         img_path = os.path.join(WORK, "frames", key + ".jpg")
@@ -59,6 +67,14 @@ for n, key in enumerate(keys):
         cam_t=o["pred_cam_t"].astype(np.float32),
         focal=np.float32(o["focal_length"]),
         bbox=boxes[key].astype(np.float32),
+        # full MHR body: mesh + explicit DIRECTIONS (orientation / per-joint global rotations)
+        verts=o["pred_vertices"].astype(np.float16),
+        global_rot=o["global_rot"].astype(np.float32),
+        joint_rots=o["pred_global_rots"].astype(np.float16),
+        joint_coords=o["pred_joint_coords"].astype(np.float32),
+        body_pose=o["body_pose_params"].astype(np.float32),
+        shape=o["shape_params"].astype(np.float32),
+        scale=o["scale_params"].astype(np.float32),
     )
     if n % SPOT == 0:
         img = cv2.imread(img_path)
