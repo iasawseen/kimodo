@@ -23,8 +23,7 @@ import mujoco
 
 _PKG = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(_PKG)
-sys.path.insert(0, _PKG)
-from fastvid import VideoWriter                          # noqa: E402
+from humanoid_motion_recon.fastvid import VideoWriter   # noqa: E402  (pip install -e ../humanoid_motion_recon)
 
 OUTD = os.environ.get("MR_OUT", os.path.join(REPO, "outputs", "figure", "pose"))
 WORK = os.environ.get("POSE_WORK",

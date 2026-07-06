@@ -4,7 +4,7 @@
 Pipeline (design/figure.md section 7; gait.md pipeline stage 1):
   fit3d.npz (world z-up, G1 scale by MR_PELVIS_H construction, smoothed, 58 joints;
              chirality-consistent - the fit MUST be produced with MR_FLIPFIX=1 for the
-             faceless figure robot, see fit_pose.py)
+             faceless figure robot, see humanoid_motion_recon.fit_pose)
     1. chirality sanity check (forward vs pelvis velocity on walking frames)
     2. direction transfer -> G1-34 joint-position targets with exact G1 bone lengths,
        placed at the fit3d pelvis with the corrected heading (world frame)
@@ -59,7 +59,7 @@ CAM = lz["c_c2w"] if "c_c2w" in lz.files else np.repeat(lz["cam_pos"][None], N, 
 # the (mirror-invariant, cleanly smoothed) fit3d pelvis velocity, pairwise = hip-line
 # continuity + a switch penalty. Only the trajectory (pelvis path) is taken from fit3d.
 # Smoothing of the articulation happens AFTER correction, where it is safe.
-# MHR-70 indices in fit_pose.KP order: body 18 + right hand 20 + left hand 20
+# MHR-70 indices in humanoid_motion_recon.fit_pose KP order: body 18 + right hand 20 + left hand 20
 KIDX70 = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 41, 62, 69] + \
     [b + 4 * f + j for b in (21, 42) for f in range(5) for j in range(4)]
 SWAP58 = SWAP18 + list(range(38, 58)) + list(range(18, 38))     # body swap + r-hand <-> l-hand

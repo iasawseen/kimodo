@@ -15,8 +15,14 @@ layers built on top of it:
   most "why is the robot doing X" questions are already answered there.
 - `figure/` — the Helix-02 reproduction package: constraint-driven segment generators + SE(2)
   chain-stitching (`gen_helix_kitchen.py`), scene/camera builders, collision gate, and the
-  MotionRecon stack (SAM-3D-Body + VGGT-Omega + rigid fitter + smoother) with its
-  visualization renderers. `design/figure.md` §0 is the file map and run order.
+  G1 retarget layer (`soma_retarget.py`, `eval_retarget.py`, `render_replay.py`).
+  `design/figure.md` §0 is the file map and run order.
+- **MotionRecon** (mono video → world skeletons + meshes: SAM-3D-Body + VGGT-Omega + rigid
+  fitter + smoother, plus all its torch-CUDA visualization renderers) now lives in the
+  standalone sibling repo `../humanoid_motion_recon` — `pip install -e`'d into both conda
+  envs; invoke as `python -m humanoid_motion_recon.<tool>` with the same env vars as before.
+  Its README/CLAUDE.md are the authoritative pipeline docs; `design/figure.md` §7 keeps the
+  Figure-scenario empirical findings.
 - `tools/` — standalone G1 rendering (`render_g1.py`) and long-trajectory stitching (`stitch.py`).
 - `outputs/` — generated artifacts (qpos CSVs, scene XMLs, videos, pose npz). Large; mostly
   uncommitted.
@@ -45,7 +51,7 @@ CUDA_VISIBLE_DEVICES=0 TEXT_ENCODERS_DIR=$HOME/.cache/kimodo/text_encoders \
 - Headless rendering: `MUJOCO_GL=egl`. The `EGLError` at interpreter exit is harmless.
 - GPU convention in this setup: GPU 0 for Kimodo generation, GPU 1 for perception (SAM/VGGT).
 - `ffmpeg` in loops needs `-nostdin`. NVENC (`h264_nvenc`) is available and is the fast path for
-  encoding point-cloud/noise-like video content (`figure/fastvid.py`); NVENC max frame dimension
+  encoding point-cloud/noise-like video content (`humanoid_motion_recon.fastvid`); NVENC max frame dimension
   is 4096 px.
 
 ## Figure pipeline run order
@@ -83,7 +89,7 @@ chain changes — everything downstream is pocket-relative by design.
   the **processed-frame pixel space** (auto-detected from `frames/f00000.jpg`); VGGT-Omega gives
   per-frame depth in large overlapping windows stitched by shared-frame affines (works for
   moving cameras). Depth over thin/moving subjects is context-inpainted — never read per-joint
-  depth from it; the rigid fitter (`fit_pose.py`) uses one body-level depth per frame + SAM's
+  depth from it; the rigid fitter (`humanoid_motion_recon.fit_pose`) uses one body-level depth per frame + SAM's
   rigid articulation. World alignment is calibrated from the subject itself (torso-up, heels =
   floor, standing pelvis height = scale), not from scene-plane fits, which measurably fail.
   Scenario-specific settings (fps, calibration windows, pelvis height, output dir) are env vars

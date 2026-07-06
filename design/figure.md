@@ -16,6 +16,11 @@ per-lever control recipes (speed / step length / turns / EE constraints) this bu
 
 ## 0. Files
 
+`humanoid_motion_recon.*` entries live in the standalone sibling repo
+`../humanoid_motion_recon` (mono video → world skeletons + meshes; `pip install -e`'d into
+both envs, run as `python -m humanoid_motion_recon.<tool>`). Its README is the pipeline
+doc; §7 here keeps the Figure-scenario findings.
+
 | File | Role |
 |---|---|
 | `figure/gen_helix_kitchen.py` | segment generators + storyboard + SE(2) chain-stitcher (GPU). Caches per-segment qpos in `outputs/figure/segs/`; CLI args name segments to force-regenerate (`all` for everything) |
@@ -23,14 +28,14 @@ per-lever control recipes (speed / step length / turns / EE constraints) this bu
 | `figure/render_scene.py` | fixed-camera renderer; animates door hinge + rack slide from segment bounds; `--sheet` for an 8-frame QA contact sheet |
 | `figure/check_collisions.py` | collision QA gate (robot vs scene solids + self-collision) |
 | `figure/gen_gestures.py` | gesture prompt probe (which gestures work under a station pin) |
-| `figure/pose_video.py`, `figure/pose_retarget.py` | SAM-3D-Body runner (per-frame MHR: keypoints + mesh + rotations, §7.1) + direction-transfer anchor retarget (§7.1) |
+| `humanoid_motion_recon.pose_video`, `figure/pose_retarget.py` | SAM-3D-Body runner (per-frame MHR: keypoints + mesh + rotations, §7.1) + direction-transfer anchor retarget (§7.1) |
 | `figure/soma_retarget.py`, `figure/render_replay.py` | SOMA-style retarget fit3d → G1 qpos (direction transfer + MuJoCo DLS IK) + vertical video/MuJoCo replay renderer, plain or kitchen scene (§7.8) |
-| `figure/sam3d_dummy_video.py`, `figure/sam3d_mesh_video.py` | chirality evidence: raw SAM 3D skeleton / 3D mesh renders (mesh cache-first from saved `verts`; §7.1) |
-| `figure/gpurender.py` | shared torch-CUDA raster utils (splat/lines/cloud/resize/colormap) used by all video renderers (§7.9) |
-| `figure/lift_mesh.py`, `figure/mesh_world_video.py` | world-lift + temporal smoothing of the SAM meshes (fit_pose transform chain per vertex) + two-pane render (§7.9) |
-| `figure/depth_video.py`, `figure/lift_skeleton.py`, `figure/fit_pose.py` | MotionRecon core: VGGT-Omega depth, world alignment + naive lift, rigid fitter + smoother (§7.2–7.5) |
+| `humanoid_motion_recon.sam3d_dummy_video`, `humanoid_motion_recon.sam3d_mesh_video` | chirality evidence: raw SAM 3D skeleton / 3D mesh renders (mesh cache-first from saved `verts`; §7.1) |
+| `humanoid_motion_recon.gpurender` | shared torch-CUDA raster utils (splat/lines/cloud/resize/colormap) used by all video renderers (§7.9) |
+| `humanoid_motion_recon.lift_mesh`, `humanoid_motion_recon.mesh_world_video` | world-lift + temporal smoothing of the SAM meshes (fit_pose transform chain per vertex) + two-pane render (§7.9) |
+| `humanoid_motion_recon.depth_video`, `humanoid_motion_recon.lift_skeleton`, `humanoid_motion_recon.fit_pose` | MotionRecon core: VGGT-Omega depth, world alignment + naive lift, rigid fitter + smoother (§7.2–7.5) |
 | `figure/fit_kitchen.py` | kitchen fit + camera solve from the reconstruction (§7.6) |
-| `figure/skel_draw.py`, `figure/birdseye_video.py`, `figure/pose_over_cloud.py`, `figure/recon3d_video.py`, `figure/recon_check_video.py` | visualization / verification videos (§7.6) |
+| `humanoid_motion_recon.skel_draw`, `humanoid_motion_recon.birdseye_video`, `humanoid_motion_recon.pose_over_cloud`, `humanoid_motion_recon.recon3d_video`, `humanoid_motion_recon.recon_check_video` | visualization / verification videos (§7.6) |
 | `figure/build_verify.sh` | rebuilds `outputs/figure/verify/` clips (video top / render bottom, time-synced) |
 | `outputs/figure/` | `figure.mp4` (source video), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
 
