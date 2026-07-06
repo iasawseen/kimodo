@@ -483,3 +483,50 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   ~40 min). Both mesh renderers now run in the kimodo env (no pyrender/cv2); accepted deltas:
   splat stipple vs smooth Phong, hard edges vs AA. Every `figure/` video renderer is now
   torch-CUDA end-to-end (decode → composite → NVENC).
+
+### 7.10 Pipeline speed: ≤8× real time on one RTX 3090
+
+Benchmark: 1 minute of figure.mp4 (1438 frames, 1280×720 @ 23.976), full MotionRecon
+(SAM-3D-Body → VGGT-Omega → lift → fit) on a single RTX 3090. Baseline ~25× real time;
+optimized **6.3×** (goal ≤8×):
+
+| Stage | Baseline | Fast (default) | Wall (1-min clip) |
+|---|---|---|---|
+| SAM-3D-Body | `full` sequential, 582 ms/f | `SAM_INFER=body` + batch 16: 48–73 ms/f | **1:45** (`full` batched: 4:46) |
+| VGGT-Omega | 512/stride 120, 328 ms/f eff. | stride 150 + `VGGT_FSTRIDE=2` + NN fill-in | **3:59** |
+| lift_skeleton | — | — | 0:11 |
+| fit_pose | — | — | 0:22 |
+| **total** | ~25 min | | **6:17** (with hands: 9:18) |
+
+- **Two SAM modes, both cross-frame batched** (`SAM_BATCH`, default 16):
+  - `SAM_INFER=body` (default, 6.3× total): body decoder only. Hand kps still produced by the
+    body decode but coarser (~5.6 cm; wrists up to ~13 cm on occasional frames). Body joints
+    deviate ≤3.3 cm / 6.6 px vs full — the two per-hand passes are 74 % of `full`'s cost.
+  - `SAM_INFER=full` (body+hands, 9.3× total; 199 vs 582 ms/f sequential): adds the per-hand
+    refinement passes. To fit ≤8× with hands, drop `VGGT_FSTRIDE=3` (untested quality).
+- **Cross-frame batching** rides the model's person dimension (`prepare_batch` carries a full
+  image per entry, so entries can be different frames; one shared `cam_int` — same video
+  resolution). Batch invariance vs the sequential path: 1 px / 6.7 mm (body mode). For `full`,
+  hand crops are made frame-aware by patching `prepare_batch` in the meta_arch module —
+  upstream crops all "persons" from ONE image; the patch substitutes each entry's own frame
+  (flipped left-hand calls detected via negative stride). A `[pose] WARN` prints if the patch
+  ever fails to engage.
+- **Refined-hand gate is bistable on this robot**: upstream's wrist-angle gate
+  (`thresh_wrist_angle=1.4`) flips refined↔body-decoded hands between consecutive frames in
+  ~2/3 of transitions even in the sequential path (robot grippers sit at the threshold), so
+  batched-vs-sequential hand kps differ up to ~20 cm on gate-flip frames while body kps stay
+  ≤6 cm — the fitter's temporal smoothing absorbs this. `SAM_WRIST_THRESH` overrides the gate
+  (raise → always trust refinement).
+- **VGGT knobs**: `VGGT_STRIDE` 120→150 (10 shared frames are plenty for the robust-affine +
+  sim(3) stitch); `VGGT_FSTRIDE=2` halves inference — downstream consumes ONE body-level depth
+  per frame through a k=19 temporal median, so half-rate depth is near-lossless; skipped
+  frames get nearest-neighbor fill-in npz so all consumers see a dense directory. `VGGT_RES`
+  stays 512 (untested quality below).
+- **bf16: measured, NOT adopted.** VGGT already autocasts bf16 internally (aggregator bf16,
+  heads fp32 — upstream design). SAM with the jit MHR rig pinned fp32 (its sparse matmul has
+  no bf16 kernel) runs but is no faster at batch 16 (50 vs 48 ms/f; CPU-side decode/transform
+  dominates and TF32 already covers the fp32 matmuls) and adds 6 px / 8.8 mm deviation.
+- **Quality gate** (fast pipeline vs the full-quality reference fit on the same 1438 frames):
+  local inter-pipeline MPJPE **1.02 cm** (p95 1.87) — 8× below the retarget's own 8.4 cm
+  floor; kappa 1.258 vs 1.257; hip-line yaw diff 1.75°. Trajectory dev 7 cm mean reflects the
+  two runs' independent VGGT normalization chains (60 s vs 216 s), not pose degradation.

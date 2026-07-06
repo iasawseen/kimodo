@@ -80,10 +80,18 @@ def load_and_preprocess_images(paths, image_resolution=512, patch_size=16):
 WORK = os.environ["DEPTH_WORK"]
 CKPT = sys.argv[1]
 S = int(os.environ.get("VGGT_WINDOW", "160"))
-T = int(os.environ.get("VGGT_STRIDE", "120"))
+T = int(os.environ.get("VGGT_STRIDE", "150"))                # 10 shared frames: the robust
+# affine + sim(3) sample 4000 px per shared frame - plenty; the old default 120 spent 25%
+# of compute on overlap with no measurable stitch gain
 OV = S - T                                                   # overlap frames
+FSTRIDE = int(os.environ.get("VGGT_FSTRIDE", "1"))           # frame subsampling (FAST: 2).
+# Downstream reads ONE body-level depth per frame, median-filtered over k=19 (fit_pose), so
+# half-rate depth is near-lossless; skipped frames get nearest-neighbor fill-in npz so every
+# consumer sees a dense directory.
+RES = int(os.environ.get("VGGT_RES", "512"))
 
-frames = sorted(glob.glob(os.path.join(WORK, "frames", "f*.jpg")))
+frames_all = sorted(glob.glob(os.path.join(WORK, "frames", "f*.jpg")))
+frames = frames_all[::FSTRIDE]
 N = len(frames)
 outd = os.path.join(WORK, "depth")
 os.makedirs(outd, exist_ok=True)
@@ -126,7 +134,7 @@ rng = np.random.default_rng(0)
 with torch.no_grad():
     for w0 in range(0, N, T):
         batch = frames[w0:w0 + S]
-        images = load_and_preprocess_images(batch).cuda()
+        images = load_and_preprocess_images(batch, image_resolution=RES).cuda()
         pred = model(images)
         depth = pred["depth"][0].float().cpu().numpy()[..., 0]   # [B,h,w]
         conf = pred["depth_conf"][0].float().cpu().numpy()
@@ -184,4 +192,16 @@ with torch.no_grad():
         print(f"[depth] {min(w0 + S, N)}/{N}  a={a:.4f} b={b:+.4f}", flush=True)
         if w0 + S >= N:
             break
+
+if FSTRIDE > 1:                                              # nearest-neighbor fill-in
+    import shutil
+    done = {os.path.basename(f)[:-4] for f in glob.glob(os.path.join(outd, "f*.npz"))}
+    for i, f in enumerate(frames_all):
+        key = os.path.basename(f)[:-4]
+        if key in done:
+            continue
+        src_i = min(range(0, len(frames_all), FSTRIDE), key=lambda j: abs(j - i))
+        src = os.path.join(outd, os.path.basename(frames_all[src_i])[:-4] + ".npz")
+        shutil.copyfile(src, os.path.join(outd, key + ".npz"))
+    print(f"[depth] fill-in complete ({len(frames_all) - N} copied)", flush=True)
 print("DONE_DEPTH", flush=True)
