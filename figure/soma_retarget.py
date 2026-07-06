@@ -45,29 +45,175 @@ SWAP18 = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 13, 14, 11, 12, 16, 15, 17]
 
 fz = np.load(os.path.join(OUTD, "fit3d.npz"))
 lz = np.load(os.path.join(OUTD, "lift3d.npz"))
-Jw_all, tsec, ok = fz["joints_w"].astype(np.float64), fz["t"], fz["ok"].astype(bool)
-N, NJ = Jw_all.shape[:2]
+Jw_fit, tsec, ok = fz["joints_w"].astype(np.float64), fz["t"], fz["ok"].astype(bool)
+N, NJ = Jw_fit.shape[:2]
 CAM = lz["c_c2w"] if "c_c2w" in lz.files else np.repeat(lz["cam_pos"][None], N, 0)
 
-# ---------------------------------------------------------------- 1. chirality check
-# fit3d arrives chirality-consistent: fit_pose.py (MR_FLIPFIX=1) undoes SAM's front/back
-# mirror on the raw kp3d BEFORE smoothing. Verify here: forward must align with the pelvis
-# velocity on walking frames.
-mid = 0.5 * (Jw_all[:, K["lhip"]] + Jw_all[:, K["rhip"]])
+# ---------------------------------------------------------------- 1. chirality-corrected joints
+# fit3d articulation is UNUSABLE for retargeting: SAM's per-frame front/back mirror flickers
+# were smoothed into the fit (design/figure.md 7.1) and cannot be undone post-hoc. Rebuild the
+# articulation from the RAW per-frame kp3d (flips still crisp there), resolve chirality at THIS
+# layer by hypothesis selection - per frame the truth is either the raw estimate or its mirror
+# (L/R label swap + depth flip about the pelvis); both hypotheses' geometry is computed
+# NUMERICALLY, and a global 2-state Viterbi picks the sequence: unaries anchor moving frames to
+# the (mirror-invariant, cleanly smoothed) fit3d pelvis velocity, pairwise = hip-line
+# continuity + a switch penalty. Only the trajectory (pelvis path) is taken from fit3d.
+# Smoothing of the articulation happens AFTER correction, where it is safe.
+# MHR-70 indices in fit_pose.KP order: body 18 + right hand 20 + left hand 20
+KIDX70 = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 41, 62, 69] + \
+    [b + 4 * f + j for b in (21, 42) for f in range(5) for j in range(4)]
+SWAP58 = SWAP18 + list(range(38, 58)) + list(range(18, 38))     # body swap + r-hand <-> l-hand
+
+# MHR rig joints for rotation targets, identified geometrically from joint_coords (stable
+# across frames): 1=pelvis (== global_rot), 112=chest/neck, 41=r wrist, 77=l wrist
+ROT_J = [1, 112, 41, 77]
+raw_cache = os.path.join(WORK, "raw58.npz")
+rc = np.load(raw_cache) if os.path.exists(raw_cache) else {}
+if "rel" in rc and "rots" in rc:
+    rel_raw, ok_raw, rots_raw = rc["rel"], rc["ok"], rc["rots"]
+else:
+    import glob as _glob
+    mfiles = sorted(_glob.glob(os.path.join(WORK, "mhr", "f*.npz")))
+    rel_raw = np.full((N, 58, 3), np.nan, np.float32)
+    rots_raw = np.full((N, 4, 3, 3), np.nan, np.float32)
+    ok_raw = np.zeros(N, bool)
+    for mf in mfiles:
+        n = int(os.path.basename(mf)[1:6])
+        if n >= N:
+            continue
+        mz = np.load(mf)
+        k3 = mz["kp3d"]
+        if not np.isfinite(k3).all():
+            continue
+        midc = 0.5 * (k3[9] + k3[10])
+        rel_raw[n] = (k3 - midc)[KIDX70]
+        if "joint_rots" in mz.files:
+            rots_raw[n] = mz["joint_rots"][ROT_J].astype(np.float32)
+        ok_raw[n] = True
+    np.savez_compressed(raw_cache, rel=rel_raw, ok=ok_raw, rots=rots_raw)
+    print(f"[soma] cached raw58 rel offsets + rig rotations -> {raw_cache}")
+ok &= ok_raw
+
+# mirrored hypothesis: L/R label swap + depth mirror about the pelvis (z=0 in rel coords)
+rel_mir = rel_raw[:, SWAP58].copy()
+rel_mir[:, :, 2] *= -1.0
+
+# world scale/orientation chain from the fit (a = offset ratio, kappa = body-size calib)
+a_s = fz["a"].astype(np.float64)
+kappa = float(fz["kappa"]) if "kappa" in fz.files else 1.0
+if "M_c2w" in lz.files:
+    R_c2w = lz["M_c2w"].astype(np.float64)               # per-frame affine (scale folded in)
+else:
+    R_c2w = np.repeat((float(lz["scale"]) * lz["R_cam2world"])[None], N, 0)
+off_raw = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_raw)
+off_mir = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_mir)
+
+# smoothed, mirror-invariant trajectory + velocity from fit3d
+mid = 0.5 * (Jw_fit[:, K["lhip"]] + Jw_fit[:, K["rhip"]])
 idx_all = np.arange(N)
 okm = np.isfinite(mid[:, 0])
 mid_i = np.stack([np.interp(idx_all, idx_all[okm], mid[okm, c]) for c in range(3)], 1)
 vel = np.gradient(mid_i, axis=0) * FPS
 speed = np.nan_to_num(np.linalg.norm(vel[:, :2], axis=1))
-hipline0 = Jw_all[:, K["lhip"]] - Jw_all[:, K["rhip"]]
-fwd0 = np.cross(hipline0, [0.0, 0.0, 1.0])
-fwd0 /= np.linalg.norm(fwd0, axis=1, keepdims=True) + 1e-9
+
+
+def _fwd(off):
+    l = off[:, K["lhip"]] - off[:, K["rhip"]]
+    f = np.cross(l, [0.0, 0.0, 1.0])
+    return f / (np.linalg.norm(f, axis=1, keepdims=True) + 1e-9), \
+        l / (np.linalg.norm(l, axis=1, keepdims=True) + 1e-9)
+
+
+FWD = [None, None]; HIP = [None, None]
+FWD[0], HIP[0] = _fwd(off_raw)
+FWD[1], HIP[1] = _fwd(off_mir)
+
+# global 2-state Viterbi over the flip sequence
+oki = np.flatnonzero(ok)
+nfr = len(oki)
+W_VEL, W_SW = 4.0, 1.5
+cost = np.zeros((nfr, 2))
+for s in (0, 1):
+    f = FWD[s][oki]
+    ali = (f[:, :2] * vel[oki, :2]).sum(1) / (speed[oki] + 1e-9)
+    cost[:, s] = np.where(speed[oki] > 0.2,
+                          W_VEL * np.maximum(0.0, -ali) * np.minimum(speed[oki], 1.0), 0.0)
+acc = cost[0].copy()
+back = np.zeros((nfr, 2), np.int8)
+for k in range(1, nfr):
+    n, p = oki[k], oki[k - 1]
+    new = np.empty(2)
+    for s in (0, 1):
+        cont = [1.0 - float(HIP[s][n] @ HIP[sp][p]) for sp in (0, 1)]
+        tr = [acc[sp] + cont[sp] + (W_SW if s != sp else 0.0) for sp in (0, 1)]
+        back[k, s] = int(np.argmin(tr))
+        new[s] = min(tr) + cost[k, s]
+    acc = new
+flip = np.zeros(N, bool)
+s = int(np.argmin(acc))
+for k in range(nfr - 1, -1, -1):
+    flip[oki[k]] = bool(s)
+    s = int(back[k, s])
+print(f"[soma] chirality (raw, hypothesis-select): {int(flip[oki].sum())}/{nfr} frames mirrored")
+
+# corrected world offsets, THEN temporal smoothing (safe post-correction), + fit3d trajectory
+off_c = np.where(flip[:, None, None], off_mir, off_raw)
+from numpy.lib.stride_tricks import sliding_window_view
+flat = off_c.reshape(N, -1)
+for c in range(flat.shape[1]):
+    v = flat[:, c]
+    m = np.isfinite(v)
+    if m.sum() < 10:
+        continue
+    vi = np.interp(idx_all, idx_all[m], v[m])
+    for kk, op in ((7, "med"), (11, "box")):
+        pad = np.pad(vi, kk // 2, mode="edge")
+        wins = sliding_window_view(pad, kk)
+        vi = np.median(wins, 1) if op == "med" else wins.mean(1)
+    v[m] = vi[m]
+Jw = mid_i[:, None] + off_c
+
+# acceptance metric: corrected forward vs velocity on walking frames
+fwd_c, _ = _fwd(off_c)
 w = ok & (speed > 0.3)
 if w.sum() > 10:
-    align = ((fwd0[w, :2] * vel[w, :2]).sum(1) > 0).mean()
+    align = ((fwd_c[w, :2] * vel[w, :2]).sum(1) > 0).mean()
     print(f"[soma] chirality check: fwd·vel>0 on {align*100:.0f}% of {int(w.sum())} walk frames "
-          f"(expect ~100 with MR_FLIPFIX fit)")
-Jw = Jw_all
+          f"(expect ~100)")
+
+# ------------------------------------------------- 1b. rotation targets (mesh/rig rotations)
+# The MHR mesh is a deterministic function of the rig's per-joint GLOBAL rotations - so
+# "retarget from mesh" = consume joint_rots. They carry what bone directions cannot: twist
+# about the bone (all 3 wrist dofs) and true torso orientation. Chirality: the mirror of a
+# rotation across the camera z-plane is the reflection conjugate S R S (S = diag(1,1,-1)),
+# plus L/R label swap for the wrists; applied per frame from the SAME Viterbi flips.
+S_MIR = np.diag([1.0, 1.0, -1.0])
+rots_sel = rots_raw.astype(np.float64).copy()           # [N,4,3,3] (pelvis, chest, rwri, lwri)
+fl = np.flatnonzero(flip)
+for n in fl:
+    rp, rc_, rr, rl = rots_raw[n].astype(np.float64)
+    rots_sel[n, 0] = S_MIR @ rp @ S_MIR
+    rots_sel[n, 1] = S_MIR @ rc_ @ S_MIR
+    rots_sel[n, 2] = S_MIR @ rl @ S_MIR                 # label swap: mirrored L drives R
+    rots_sel[n, 3] = S_MIR @ rr @ S_MIR
+# RELATIVE rotations, WORLD axes. Two failure modes bracketed this design: global deltas
+# double-count the chain (the analytic root already encodes torso lean -> waist clamps and
+# recruits yaw/roll, twisted bows); rig-local right-composed deltas assume the rig joint's
+# local axes match the G1 link's - they don't (v4: garbage targets, body-wide saturation).
+# Convention-free form: the world-axes rotation from parent to child, Q = R_child @ R_parent^T;
+# transfer its delta vs the stand reference onto the G1's own per-frame parent.
+R_wc = R_c2w / np.cbrt(np.maximum(np.linalg.det(R_c2w), 1e-12))[:, None, None]
+rots_w = np.einsum("nkj,nqjm->nqkm", R_wc, rots_sel)    # [N,4,3,3] world (pelvis,chest,rw,lw)
+Q_chest = np.einsum("nkl,nml->nkm", rots_w[:, 1], rots_w[:, 0])   # chest @ pelvis^T
+Q_rwri = np.einsum("nkl,nml->nkm", rots_w[:, 2], rots_w[:, 1])    # r wrist @ chest^T
+Q_lwri = np.einsum("nkl,nml->nkm", rots_w[:, 3], rots_w[:, 1])
+# reference frame: middle of the stand window (heading-consistent with the G1 reference pose)
+st0 = float(os.environ.get("MR_STAND0", "7.5")); st1 = float(os.environ.get("MR_STAND1", "9.5"))
+cand = np.flatnonzero(ok & (tsec >= st0) & (tsec <= st1))
+REF_N = int(cand[len(cand) // 2]) if len(cand) else int(np.flatnonzero(ok)[0])
+D_chest = np.einsum("nkl,ml->nkm", Q_chest, Q_chest[REF_N])       # dQ = Q(n) @ Q(ref)^T
+D_rwri = np.einsum("nkl,ml->nkm", Q_rwri, Q_rwri[REF_N])
+D_lwri = np.einsum("nkl,ml->nkm", Q_lwri, Q_lwri[REF_N])
 
 # ---------------------------------------------------------------- 2. direction transfer targets
 BONES34 = G1Skeleton34.bone_order_names_with_parents
@@ -104,6 +250,8 @@ SEG = {  # G1 bone -> (a, b) human segment in KPN names; None = stand direction 
     "right_wrist_roll_skel": ("relb", "rwri"), "right_wrist_pitch_skel": ("relb", "rwri"),
     "right_wrist_yaw_skel": ("relb", "rwri"), "right_hand_roll_skel": ("relb", "rwri"),
 }
+LEG_SPLAY = float(os.environ.get("SOMA_LEG_SPLAY", "1.0"))
+STRAIGHT = float(os.environ.get("SOMA_STRAIGHT", "0.0"))
 LEG_DAMP = {"left_knee_skel", "right_knee_skel", "left_ankle_pitch_skel",
             "right_ankle_pitch_skel", "left_ankle_roll_skel", "right_ankle_roll_skel"}
 
@@ -141,12 +289,12 @@ for n in range(N):
             nl = np.linalg.norm(d)
             d = STAND_DIR[i] if nl < 1e-6 else d / nl
         if name in LEG_DAMP:                           # SAM overestimates the robot's leg splay
-            d = d.copy(); d[0] *= 0.55
+            d = d.copy(); d[0] *= LEG_SPLAY
             d /= np.linalg.norm(d)
         pose[i] = pose[p] + BONE_LEN[i] * d
     for j, name in enumerate(NAMES):                   # partial leg straightening (see doc 7.4)
         if any(s in name for s in ("hip", "knee", "ankle", "toe")):
-            pose[j] = 0.85 * pose[j] + 0.15 * (STAND[j] - STAND[IDX["pelvis_skel"]])
+            pose[j] = (1 - STRAIGHT) * pose[j] + STRAIGHT * (STAND[j] - STAND[IDX["pelvis_skel"]])
     pose -= pose[IDX["pelvis_skel"]]
     if n % 500 == 0:                                   # residual-yaw self-check (pose_retarget)
         hp = kp[K["lhip"]] - kp[K["rhip"]]
@@ -155,8 +303,42 @@ for n in range(N):
     # back to world: un-yaw (kimodo), kimodo->world, translate to the fit3d mid-hip
     targets[n] = (pose @ Ry) @ M_W2K + mid[n]
 
+# re-anchor arm targets on the REACHABLE chain: the direction-transfer composes G1-34 skeleton
+# bone lengths from the lumbar, which lands elbow/wrist targets 15-20 cm off the XML chain's
+# manifold (measured: ankle target->achieved 1.2 cm, arms 15-20 cm). Rebuild them from the
+# shoulder target with the XML segment lengths along the MOCAP directions - feasible by
+# construction; arm fidelity is then a direction match (mocap arms are ~30% longer than G1's,
+# so absolute wrist position has an irreducible proportional floor).
+_mx = mujoco.MjModel.from_xml_path(G1_XML)
+_dx = mujoco.MjData(_mx)
+_dx.qpos[:] = 0; _dx.qpos[3] = 1
+mujoco.mj_kinematics(_mx, _dx)
+
+
+def _xml_len(a, b):
+    return float(np.linalg.norm(_dx.xpos[_mx.body(a).id] - _dx.xpos[_mx.body(b).id]))
+
+
+L_UA = {"l": _xml_len("left_shoulder_pitch_link", "left_elbow_link"),
+        "r": _xml_len("right_shoulder_pitch_link", "right_elbow_link")}
+L_FA = {"l": _xml_len("left_elbow_link", "left_wrist_yaw_link"),
+        "r": _xml_len("right_elbow_link", "right_wrist_yaw_link")}
+for sd, pre in (("l", "left"), ("r", "right")):
+    sho_t = targets[:, IDX[f"{pre}_shoulder_pitch_skel"]]
+    d_ue = Jw[:, K[f"{sd}elb"]] - Jw[:, K[f"{sd}sho"]]
+    d_ue /= np.linalg.norm(d_ue, axis=1, keepdims=True) + 1e-9
+    elb_t = sho_t + L_UA[sd] * d_ue
+    d_fw = Jw[:, K[f"{sd}wri"]] - Jw[:, K[f"{sd}elb"]]
+    d_fw /= np.linalg.norm(d_fw, axis=1, keepdims=True) + 1e-9
+    wri_t = elb_t + L_FA[sd] * d_fw
+    targets[:, IDX[f"{pre}_elbow_skel"]] = elb_t
+    for wn in (f"{pre}_wrist_roll_skel", f"{pre}_wrist_pitch_skel",
+               f"{pre}_wrist_yaw_skel", f"{pre}_hand_roll_skel"):
+        targets[:, IDX[wn]] = wri_t
+
 np.savez_compressed(os.path.join(OUTD, "g1_targets.npz"), targets=targets.astype(np.float32),
-                    ok=ok, t=tsec)
+                    ok=ok, t=tsec,
+                    mocap=Jw.astype(np.float32), flip=flip)   # corrected mocap for eval_retarget
 
 # ---------------------------------------------------------------- 3. MuJoCo DLS IK
 m = mujoco.MjModel.from_xml_path(G1_XML)
@@ -171,8 +353,10 @@ TRACK = [  # (G1-34 target joint, xml body, weight)
     ("left_wrist_yaw_skel", "left_wrist_yaw_link", 1.5),
     ("right_wrist_yaw_skel", "right_wrist_yaw_link", 1.5),
 ]
+ARM_SCALE = float(os.environ.get("SOMA_W_ARM", "1.0"))
 BID = [m.body(b).id for _, b, _ in TRACK]
-WGT = np.array([w for _, _, w in TRACK])
+WGT = np.array([w * (ARM_SCALE if any(k in j for k in ("shoulder", "elbow", "wrist")) else 1.0)
+                for j, _, w in TRACK])
 TIDX = [IDX[j] for j, _, _ in TRACK]
 # toe point fixed in each ankle body (stand-pose offset), tracks the toe target
 TOE = {"left": (IDX["left_toe_base"], m.body("left_ankle_roll_link").id),
@@ -203,6 +387,70 @@ def mat2quat(R):
     return q
 
 
+def rotvec_err(R_tgt, R_cur):
+    """axis*angle of R_tgt @ R_cur.T (the rotation still needed)."""
+    q = mat2quat(R_tgt @ R_cur.T)
+    v = np.empty(3)
+    mujoco.mju_quat2Vel(v, q, 1.0)
+    return v
+
+
+# rig-rotation targets -> G1 link orientations by LOCAL delta transfer: the rig's
+# chest-in-pelvis delta drives torso-in-root; each wrist-in-chest delta drives
+# wrist-in-torso. Composed per frame onto the G1's OWN root/torso, so nothing is
+# double-counted with the analytic root or the position-tracked arm chain.
+pos_r, R_r = root_pose(REF_N)
+d.qpos[:] = 0.0
+d.qpos[:3] = pos_r
+d.qpos[3:7] = mat2quat(R_r)
+mujoco.mj_kinematics(m, d)
+B_TORSO = m.body("torso_link").id
+B_LWRI = m.body("left_wrist_yaw_link").id
+B_RWRI = m.body("right_wrist_yaw_link").id
+R_torso0 = d.xmat[B_TORSO].reshape(3, 3).copy()
+TQ0 = R_torso0 @ R_r.T                                  # G1 ref world-axes torso-vs-root
+WQ0_L = d.xmat[B_LWRI].reshape(3, 3) @ R_torso0.T       # G1 ref world-axes wrist-vs-torso
+WQ0_R = d.xmat[B_RWRI].reshape(3, 3) @ R_torso0.T
+W_ORI_T = float(os.environ.get("SOMA_W_TORSO", "0.0"))
+W_ORI_W = float(os.environ.get("SOMA_W_WRIST", "0.0"))
+
+# dynamic arm anchoring: elbow/wrist targets rebuilt EVERY IK iteration from the CURRENT
+# shoulder link along the mocap directions (pure direction matching, feasible from wherever
+# the shoulder actually is - static arm targets assumed the shoulder hits its own target,
+# which it misses by ~10 cm, and the least-squares compromise bent the forearm ~50 deg)
+D_UE, D_FW = {}, {}
+for sd, pre in (("l", "left"), ("r", "right")):
+    v = Jw[:, K[f"{sd}elb"]] - Jw[:, K[f"{sd}sho"]]
+    D_UE[sd] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+    v = Jw[:, K[f"{sd}wri"]] - Jw[:, K[f"{sd}elb"]]
+    D_FW[sd] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+ARM_DYN = [(sd,
+            m.body(f"{pre}_shoulder_pitch_link").id,
+            m.body(f"{pre}_elbow_link").id,
+            m.body(f"{pre}_wrist_yaw_link").id,
+            1.0, 1.5)
+           for sd, pre in (("l", "left"), ("r", "right"))]
+ARM_BIDS = {b for _, _, be, bw, _, _ in ARM_DYN for b in (be, bw)}
+# legs: same dynamic anchoring off the live hip link (same off-manifold disease as the arms)
+D_TH, D_SH = {}, {}
+for sd in ("l", "r"):
+    v = Jw[:, K[f"{sd}kne"]] - Jw[:, K[f"{sd}hip"]]
+    D_TH[sd] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+    v = Jw[:, K[f"{sd}ank"]] - Jw[:, K[f"{sd}kne"]]
+    D_SH[sd] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+L_TH = {sd: _xml_len(f"{pre}_hip_pitch_link", f"{pre}_knee_link")
+        for sd, pre in (("l", "left"), ("r", "right"))}
+L_SH = {sd: _xml_len(f"{pre}_knee_link", f"{pre}_ankle_roll_link")
+        for sd, pre in (("l", "left"), ("r", "right"))}
+LEG_DYN = [(sd,
+            m.body(f"{pre}_hip_pitch_link").id,
+            m.body(f"{pre}_knee_link").id,
+            m.body(f"{pre}_ankle_roll_link").id,
+            1.0, 2.0)
+           for sd, pre in (("l", "left"), ("r", "right"))]
+LEG_BIDS = {b for _, _, bk, ba, _, _ in LEG_DYN for b in (bk, ba)}
+ARM_BIDS |= LEG_BIDS
+
 qpos_out = np.full((N, 36), np.nan)
 q_warm = None
 nv = m.nv
@@ -215,21 +463,49 @@ for n in range(N):
     d.qpos[3:7] = mat2quat(R)
     d.qpos[7:] = q_warm if q_warm is not None else 0.0
     tgt = targets[n]
-    for it in range(6):
+    for it in range(int(os.environ.get("SOMA_ITERS", "6"))):
         mujoco.mj_kinematics(m, d)
         mujoco.mj_comPos(m, d)
         rows, Js = [], []
         for (tj, bid, w) in zip(TIDX, BID, WGT):
+            if bid in ARM_BIDS:
+                continue                                # arm elbow/wrist handled dynamically
             jacp = np.zeros((3, nv)); jacr = np.zeros((3, nv))
             mujoco.mj_jacBody(m, d, jacp, jacr, bid)
             rows.append(w * (tgt[tj] - d.xpos[bid]))
             Js.append(w * jacp[:, 6:])
+        for sd, bs, be, bw, we, ww in ARM_DYN:          # dynamic arm targets off the live shoulder
+            elb_t = d.xpos[bs] + L_UA[sd] * D_UE[sd][n]
+            wri_t = elb_t + L_FA[sd] * D_FW[sd][n]
+            for bid, w, t_ in ((be, we, elb_t), (bw, ww, wri_t)):
+                jacp = np.zeros((3, nv)); jacr = np.zeros((3, nv))
+                mujoco.mj_jacBody(m, d, jacp, jacr, bid)
+                rows.append(w * (t_ - d.xpos[bid]))
+                Js.append(w * jacp[:, 6:])
+        for sd, bh, bk, ba, wk, wa in LEG_DYN:          # dynamic leg targets off the live hip
+            kne_t = d.xpos[bh] + L_TH[sd] * D_TH[sd][n]
+            ank_t = kne_t + L_SH[sd] * D_SH[sd][n]
+            for bid, w, t_ in ((bk, wk, kne_t), (ba, wa, ank_t)):
+                jacp = np.zeros((3, nv)); jacr = np.zeros((3, nv))
+                mujoco.mj_jacBody(m, d, jacp, jacr, bid)
+                rows.append(w * (t_ - d.xpos[bid]))
+                Js.append(w * jacp[:, 6:])
         for side, (tj, bid) in TOE.items():
             pt = d.xpos[bid] + d.xmat[bid].reshape(3, 3) @ (TOE_LOC * (1 if side == "left" else 1))
             jacp = np.zeros((3, nv)); jacr = np.zeros((3, nv))
             mujoco.mj_jac(m, d, jacp, jacr, pt, bid)
             rows.append(1.5 * (tgt[tj] - pt))
             Js.append(1.5 * jacp[:, 6:])
+        if np.isfinite(D_chest[n, 0, 0]):               # rig-rotation orientation residuals
+            R_tgt_torso = D_chest[n] @ TQ0 @ R          # world-axes deltas on the G1's chain
+            R_cur_torso = d.xmat[B_TORSO].reshape(3, 3)
+            for bid, w, R_tgt in ((B_TORSO, W_ORI_T, R_tgt_torso),
+                                  (B_LWRI, W_ORI_W, D_lwri[n] @ WQ0_L @ R_cur_torso),
+                                  (B_RWRI, W_ORI_W, D_rwri[n] @ WQ0_R @ R_cur_torso)):
+                jacp = np.zeros((3, nv)); jacr = np.zeros((3, nv))
+                mujoco.mj_jacBody(m, d, jacp, jacr, bid)
+                rows.append(w * rotvec_err(R_tgt, d.xmat[bid].reshape(3, 3)))
+                Js.append(w * jacr[:, 6:])
         r = np.concatenate(rows)
         J = np.concatenate(Js, 0)
         dq = np.linalg.solve(J.T @ J + 1e-4 * np.eye(29), J.T @ r)
@@ -250,8 +526,11 @@ for c in range(36):                                    # linear gap fill (quat r
     qpos_out[:, c] = np.interp(idx, idx[okq], qpos_out[okq, c])
 qpos_out = qpos_out[first:last + 1]
 # temporal smoothing (targets are smooth; this kills residual IK jitter / axis flips):
-# 5-frame median + 7-frame box on every column, quat renormalized after
-for c in range(36):
+# 5-frame median + 7-frame box on every column, quat renormalized after.
+# SOMA_QSMOOTH=0 disables (eval instrumentation: hinge-space smoothing compounds across the
+# 4-hinge arm chain and can rotate the forearm during fast unloading motions)
+QS = int(os.environ.get("SOMA_QSMOOTH", "1"))
+for c in range(36 if QS else 0):
     v = qpos_out[:, c]
     for kk, op in ((5, "med"), (7, "box")):
         pad = np.pad(v, kk // 2, mode="edge")

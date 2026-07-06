@@ -397,13 +397,59 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   real one is; `SCENE=kitchen` translates the trajectory into the reproduction kitchen by
   (scene work spot − `kitchen_fit.json` pocket) — both frames are +X = work-facing by
   construction — with the dishwasher door/rack held open.
-- **Honest gaps**: G1 bends less than the Figure robot (waist pitch caps at ±0.52 rad; the
-  morphology gap is real, not a tracking error); arms track approximately (position IK, no
-  orientation targets yet). **Chirality is unresolved at this layer**: fit3d arrives faithful
-  to SAM's mirror-afflicted estimates (the in-fitter fix was reverted, §7.1), so mirrored
-  stretches surface as spurious 180° turns in the replay. Next: resolve chirality INSIDE the
-  retarget (fit3d stays untouched) using the saved `global_rot` as the facing observation, and
-  move to a rotation-based retarget from per-joint `joint_rots`.
+- **Chirality (v2, SOLVED here)**: articulation comes from RAW per-frame kp3d (cached
+  `raw58.npz`), NOT from fit3d whose smoothing blended mirror flickers irrecoverably. Per
+  frame both hypotheses (raw / mirrored) are computed numerically and a global 2-state Viterbi
+  selects the sequence — velocity unaries anchored to fit3d's mirror-invariant pelvis path,
+  hip-line continuity pairwise, switch penalty. No polarity convention exists to invert
+  (hypothesis selection, not sign correction). Smoothing runs AFTER selection. fit3d
+  contributes only the trajectory + scale chain (`a`, kappa). Result: 2 heading jumps
+  >45°/frame (was 23; max 161°→54°), 90 % walk-frame forward-velocity alignment (residual =
+  genuine pivots), 898/4970 frames un-mirrored.
+- **Rotation targets from the rig ("retarget from mesh", v5)**: the MHR mesh is a
+  deterministic function of `joint_rots` — so mesh-retargeting = consuming the rotation field,
+  which carries what bone directions cannot: twist about the bone (all 3 wrist dofs) and true
+  torso orientation. Rig joints identified geometrically from `joint_coords` (pelvis 1 ==
+  `global_rot`, chest 112, wrists 41/77; stable across frames). Two failure modes bracket the
+  correct transfer: GLOBAL deltas double-count the chain (the analytic root already encodes
+  torso lean → waist clamps at ±30° and least-squares recruits yaw/roll → twisted bows;
+  global wrist targets demand the whole arm chain's rotation from 3 wrist dofs → 25–49 %
+  saturation); RIG-LOCAL right-composed deltas assume the rig joint's local axes match the G1
+  link's (they don't → garbage targets, body-wide saturation). The convention-free form is the
+  **world-axes relative rotation** `Q = R_child @ R_parent^T`; transfer `ΔQ = Q(n) @ Q(ref)^T`
+  (ref = stand window) composed onto the G1's OWN per-frame root/torso. Mirror hypothesis for
+  rotations = reflection conjugate `S R S`, S = diag(1,1,−1), + L/R wrist swap, driven by the
+  same Viterbi flips. Weights 0.6 torso / 0.5 wrists, below the position targets. Sustained
+  waist-pitch saturation during the work phase is CORRECT — the video robot bends past G1's
+  ±0.52 rad; the excess lives in the root pitch.
+- **Kitchen placement**: self-anchoring — the robot is planted at the work pocket for
+  t ≈ 12–190 s, so the replay's own work-phase median is the recon pocket
+  (`kitchen_fit.json`'s pocket went stale when the reconstruction frame changed and put the
+  robot ~9 m off-camera).
+- **Eval-driven convergence** (`eval_retarget.py`: mocap = corrected MotionRecon joints vs FK
+  of the replay; MPJPE global/local, per-joint, bone directions, heading, lag, foot skate,
+  10 s timeline; guards against stale artifacts — a crashed retarget leaves the previous csv
+  in place, which silently poisoned two earlier "results"). Optimization trace (MPJPE local):
+  rotation-targets 19.8 cm → drop rotation targets 12.0 → drop leg heuristics 11.9 → static
+  reachable arm targets 11.6 → **dynamic arm anchoring 9.8** → **dynamic legs 8.4 cm**
+  (p95 15.8, every bone direction ≤ 3.1°, heading 3.2°, foot skate 0.03 m/s).
+  The decisive idea: **dynamic anchoring** — child position targets (elbow/wrist, knee/ankle)
+  are rebuilt EVERY IK iteration from the live parent link along the mocap bone directions
+  with XML segment lengths. Static pre-computed targets assume each parent hits its own
+  target; every parent miss cascades down-chain as direction error (measured: ankle
+  target→achieved 1.2 cm vs arms 15–20 cm before the change; forearm direction 50°→2.5°).
+  Limb tracking is thereby pure DIRECTION matching — the correct objective across mismatched
+  morphologies: the mocap's arms are ~30 % longer than G1's (23.8 vs 18.4 cm forearm), so
+  absolute limb-end positions have an irreducible proportional floor (~10–13 cm) while
+  directions converge to ~1–3°.
+- **The rig-rotation targets were net-negative and are OFF by default** (SOMA_W_TORSO/WRIST=0):
+  global deltas double-count the chain, rig-local deltas assume axis conventions that do not
+  hold, and the world-relative form still lost to position-only on the eval (19.8 vs 12.0).
+  The leg splay-damp/straightening heuristics are likewise off (SOMA_LEG_SPLAY=1, STRAIGHT=0).
+- **Honest gaps**: limb-end absolute positions carry the ~30 % proportion gap (directions are
+  matched instead); G1 bends less than the Figure robot (waist ±0.52 rad; morphology); hands
+  are rigid mittens vs the video's articulated fingers; ~10 % of walk frames keep ambiguous
+  facing through pivots.
 
 ### 7.9 Mesh lifting + GPU rendering infrastructure
 

@@ -42,11 +42,16 @@ qpos = np.loadtxt(os.path.join(OUTD, "g1_replay.csv"), delimiter=",")
 if SCENE == "kitchen":
     XML = os.path.join(FIG, "kitchen_g1.xml")
     meta = json.load(open(os.path.join(FIG, "helix_kitchen_scene.json")))
-    kfit = json.load(open(os.path.join(OUTD, "kitchen_fit.json")))
     hk = np.loadtxt(os.path.join(FIG, "helix_kitchen.csv"), delimiter=",")
     bounds = dict(json.load(open(os.path.join(FIG, "helix_kitchen_bounds.json")))["bounds"])
     pW = hk[bounds["open_door"], :2]                    # scene work spot
-    shift = pW - np.array(kfit["pocket"])               # recon frame -> scene frame (both +X-aligned)
+    # recon -> scene translation (both frames +X work-facing): the robot is PLANTED at the
+    # work pocket for most of the video (t ~ 12-190 s), so the replay's own work-phase median
+    # IS the recon pocket. (kitchen_fit.json's pocket is stale - solved against an earlier
+    # reconstruction's world frame - and put the robot ~9 m off-camera.)
+    i0, i1 = int((12.0 - T0) * FPS), int((190.0 - T0) * FPS)
+    pR = np.nanmedian(qpos[max(0, i0):max(1, i1), :2], axis=0)
+    shift = pW - pR
     qpos = qpos.copy()
     qpos[:, 0] += shift[0]; qpos[:, 1] += shift[1]
     cam_lookat = meta["lookat"]; cam_az = meta["azimuth"]
