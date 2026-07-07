@@ -8,8 +8,10 @@ NVIDIA's **Kimodo** (kinematic motion diffusion model, `kimodo/` package) plus l
 layers built on top of it:
 
 - `design/` — **the living empirical documentation.** `gait.md` (how to control G1 gait with
-  constraints: speed, step length, turns, EE keyframes, runtime gotchas) and `figure.md` (the
-  Figure "Helix 02" video reproduction + the MotionRecon perception pipeline). These are
+  constraints: speed, step length, turns, EE keyframes, runtime gotchas), `figure.md` (the
+  Figure "Helix 02" video reproduction + the MotionRecon perception pipeline), and
+  `humanoid_motion_recon.md` (alternatives survey + design considerations for the
+  MotionRecon package). These are
   maintained findings-first documents: when you learn something new that contradicts or extends
   them, update them in the same change. Read the relevant sections before generating motion —
   most "why is the robot doing X" questions are already answered there.
