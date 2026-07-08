@@ -139,3 +139,29 @@ Human3R <https://github.com/fanegg/Human3R> · VideoMimic <https://www.videomimi
 PHC <https://github.com/ZhengyiLuo/PHC> · GMR (Stanford, arXiv:2510.02252) ·
 OmniRetarget (arXiv:2509.26633, in amazon-far/holosoma) · NLF (Sárándi & Pons-Moll,
 NeurIPS 24) · SLAHMR <https://github.com/vye16/slahmr> · Sapiens (Meta, ECCV 24)
+
+## 8. Import queue progress (2026-07-08)
+
+- **#7 `VGGT_RES=448`: measured, not adopted.** Depth stage 3:59 → 2:37 (−34%); yaw-aligned
+  pose is quality-equivalent (0.96 cm local MPJPE vs 512), but the fixed-window yaw anchor
+  moved 19° under the depth perturbation — a knife-edge in the hand-tuned calibration, not
+  in the pose. Revisit once auto-calibration stabilizes the anchor.
+- **#13 regression harness: checked in** (`bench/quality_gate.py` + `bench/run_bench.sh` in
+  the package repo; local MPJPE / trajectory / yaw / kappa with PASS-FAIL thresholds and
+  `--align-yaw` for convention-differing runs). Reproduces the official 1.02 cm result.
+- **#1 auto-calibration: implemented as opt-in `MR_AUTO=1`, not yet at parity.** What works:
+  stance/upright detection (leg-extension + torso-alignment + stillness + heel depth-band
+  visibility), robust kappa (per-frame implied kappa over pelvis-plateau frames, tiptoe
+  frames excluded via heel-toe gap), fit-side floor re-anchor, heel-plane up leveling,
+  yaw from dominant upright facing + walk-displacement sign. Measured: cross-resolution
+  (512 vs 448) consistency ~3 cm / 1.3° — the fragility #7 exposed is gone in auto mode.
+  Honest gaps: ~10 cm local MPJPE vs the hand-tuned reference, driven by a systematic
+  lift-space (VGGT depth heels) vs fit-space (SAM offset heels) discrepancy — leveling and
+  floor/scale estimated in one space don't zero the other's residuals; auto yaw convention
+  is the subject's true facing, ~180°−22° from the legacy figure convention (SAM mirrored
+  the back-to-camera door frames the legacy window measured; scene/renders absorbed it
+  consistently). Next step when resumed: unify calibration in fit space end-to-end (lift
+  consumes fit-side stats, or one joint estimation pass), then re-gate and consider making
+  auto the default + adopting 448.
+- Default (non-auto) pipeline verified unregressed after all changes: gate PASS at 0.78 cm,
+  kappa 1.257 exact.
