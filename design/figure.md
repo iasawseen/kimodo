@@ -37,7 +37,7 @@ doc; §7 here keeps the Figure-scenario findings.
 | `figure/fit_kitchen.py` | kitchen fit + camera solve from the reconstruction (§7.6) |
 | `humanoid_motion_recon.skel_draw`, `humanoid_motion_recon.birdseye_video`, `humanoid_motion_recon.pose_over_cloud`, `humanoid_motion_recon.recon3d_video`, `humanoid_motion_recon.recon_check_video` | visualization / verification videos (§7.6) |
 | `figure/build_verify.sh` | rebuilds `outputs/figure/verify/` clips (video top / render bottom, time-synced) |
-| `outputs/figure/` | `figure.mp4` (source video), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
+| `outputs/figure/` | `figure.mp4` (symlink; source videos + recon render mp4s live in `../humanoid_motion_recon/videos/`), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
 
 Run order (env per [gait.md](gait.md) §6):
 

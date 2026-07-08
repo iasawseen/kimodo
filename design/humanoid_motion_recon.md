@@ -155,13 +155,17 @@ NeurIPS 24) · SLAHMR <https://github.com/vye16/slahmr> · Sapiens (Meta, ECCV 2
   frames excluded via heel-toe gap), fit-side floor re-anchor, heel-plane up leveling,
   yaw from dominant upright facing + walk-displacement sign. Measured: cross-resolution
   (512 vs 448) consistency ~3 cm / 1.3° — the fragility #7 exposed is gone in auto mode.
-  Honest gaps: ~10 cm local MPJPE vs the hand-tuned reference, driven by a systematic
-  lift-space (VGGT depth heels) vs fit-space (SAM offset heels) discrepancy — leveling and
-  floor/scale estimated in one space don't zero the other's residuals; auto yaw convention
-  is the subject's true facing, ~180°−22° from the legacy figure convention (SAM mirrored
-  the back-to-camera door frames the legacy window measured; scene/renders absorbed it
-  consistently). Next step when resumed: unify calibration in fit space end-to-end (lift
-  consumes fit-side stats, or one joint estimation pass), then re-gate and consider making
-  auto the default + adopting 448.
+  2026-07-08 (continued): **fit-space unification landed.** The up vector is now measured
+  on fit-space standing heels and the rigid correction is exported back into lift3d
+  (scene + camera chain + lift joints stay congruent); floor/scale remain lift-owned
+  (scene must meet the feet), kappa remains fit-owned (offsets vs ray) — the two-space
+  discrepancy is resolved by ownership, not averaging. Measured: 448-vs-512 gate PASS
+  (1.99 cm, kappa 0.3%, yaw 1.3°); fit-space floor tilt 6.5°→1.6°, standing heel float
+  +0.6 cm; idempotent re-runs converge. Residual 7.5–7.9 cm vs the hand-tuned reference is
+  now substantially the REFERENCE's own error (its floor tilts 8.5° on the same data —
+  the gate measures disagreement, not correctness). Auto yaw convention = subject's true
+  facing, ~180°−22° from legacy (SAM mirrored the back-to-camera door frames the legacy
+  window measured). Remaining before flipping auto to default: validate on a second
+  scenario (vera), re-render a kitchen replay for visual sanity, then adopt 448.
 - Default (non-auto) pipeline verified unregressed after all changes: gate PASS at 0.78 cm,
   kappa 1.257 exact.
