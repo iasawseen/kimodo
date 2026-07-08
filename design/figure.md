@@ -36,6 +36,7 @@ doc; §7 here keeps the Figure-scenario findings.
 | `humanoid_motion_recon.depth_video`, `humanoid_motion_recon.lift_skeleton`, `humanoid_motion_recon.fit_pose` | MotionRecon core: VGGT-Omega depth, world alignment + naive lift, rigid fitter + smoother (§7.2–7.5) |
 | `figure/fit_kitchen.py` | kitchen fit + camera solve from the reconstruction (§7.6) |
 | `humanoid_motion_recon.skel_draw`, `humanoid_motion_recon.birdseye_video`, `humanoid_motion_recon.pose_over_cloud`, `humanoid_motion_recon.recon3d_video`, `humanoid_motion_recon.recon_check_video` | visualization / verification videos (§7.6) |
+| `figure/export_soma_motion.py` | fit3d (+ mesh) → Kimodo SOMA-77 motion npz (motion-seed schema: local/global rot mats, FK posed_joints, root, heading, foot contacts); direction-transfer retarget, validated round-trip vs a reference seed |
 | `figure/build_verify.sh` | rebuilds `outputs/figure/verify/` clips (video top / render bottom, time-synced) |
 | `outputs/figure/` | `figure.mp4` (symlink; source videos + recon render mp4s live in `../humanoid_motion_recon/videos/`), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
 
