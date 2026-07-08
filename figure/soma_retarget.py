@@ -105,6 +105,21 @@ if "M_c2w" in lz.files:
     R_c2w = lz["M_c2w"].astype(np.float64)               # per-frame affine (scale folded in)
 else:
     R_c2w = np.repeat((float(lz["scale"]) * lz["R_cam2world"])[None], N, 0)
+# ---- optional uniform rescale to G1 size (SOMA_SCALE=auto: pelvis plateau -> 0.72 m).
+# Fits calibrated to non-G1 subjects (e.g. human, 0.93 m pelvis) otherwise hand the IK an
+# unreachable larger skeleton (targets and trajectory both live in fit-world scale).
+_sc = os.environ.get("SOMA_SCALE", "auto")
+if _sc == "auto":
+    _pel = 0.5 * (Jw_fit[:, K["lhip"], 2] + Jw_fit[:, K["rhip"], 2])
+    _pel = _pel[ok & np.isfinite(_pel)]
+    F_SC = 0.72 / float(np.median(_pel[_pel > np.percentile(_pel, 85) * 0.97]))
+else:
+    F_SC = float(_sc)
+if abs(F_SC - 1.0) > 1e-6:
+    Jw_fit = Jw_fit * F_SC
+    R_c2w = R_c2w * F_SC                                 # scale rides the c2w affine
+    print(f"[soma] SOMA_SCALE={_sc}: x{F_SC:.3f} to G1 pelvis scale")
+
 off_raw = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_raw)
 off_mir = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_mir)
 

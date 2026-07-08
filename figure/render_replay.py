@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Replay comparison video: source video frames on TOP, G1 replay in MuJoCo BELOW (vertical).
+"""Replay comparison video: source video frames LEFT, G1 replay in MuJoCo RIGHT (LAYOUT=v
+stacks them vertically instead).
 
 Two scene modes:
   SCENE=plain   (default) bare floor, camera at the RECONSTRUCTED video camera (lift3d pose +
@@ -59,12 +60,23 @@ else:
     XML = os.path.join(REPO, "kimodo/assets/skeletons/g1skel34/xml/g1.xml")
     lz = np.load(os.path.join(OUTD, "lift3d.npz"))
     view = lz["R_cam2world"] @ np.array([0.0, 0.0, 1.0]); view /= np.linalg.norm(view)
-    DIST = 4.0
+    fovy = float(np.degrees(lz["fov_h"])) if "fov_h" in lz.files else 30.0
+    _d = os.environ.get("DIST", "auto")                  # auto: ~2.2 m vertical span at the
+    DIST = (1.1 / np.tan(np.radians(fovy) / 2)          # robot, whatever the lens
+            if _d == "auto" else float(_d))
     cam_lookat = (lz["cam_pos"] + DIST * view).tolist()
     cam_az = float(np.degrees(np.arctan2(view[1], view[0])))
     cam_el = float(np.degrees(np.arcsin(np.clip(view[2], -1, 1))))
     cam_dist = DIST
-    fovy = float(np.degrees(lz["fov_h"])) if "fov_h" in lz.files else 30.0
+    # CAM=track (default): follow the robot like the source tracking shot - lookat rides a
+    # smoothed pelvis path (fixed az/el/dist from the reconstructed camera). CAM=fixed keeps
+    # the static reconstructed-camera framing.
+    if os.environ.get("CAM", "track") == "track":
+        k = int(2 * round(1.0 * FPS / 2) + 1)            # ~1 s box smooth, odd
+        pad = np.pad(qpos[:, :3], ((k // 2, k // 2), (0, 0)), mode="edge")
+        cam_lookat = np.stack([np.convolve(pad[:, c], np.ones(k) / k, "valid")
+                               for c in range(3)], 1)
+        cam_lookat[:, 2] = 0.7                           # frame the whole body
 
 m = mujoco.MjModel.from_xml_path(XML)
 m.vis.global_.offwidth, m.vis.global_.offheight = PW, PH
@@ -72,7 +84,7 @@ m.vis.global_.fovy = fovy
 d = mujoco.MjData(m)
 r = mujoco.Renderer(m, height=PH, width=PW)
 cam = mujoco.MjvCamera()
-cam.lookat[:] = cam_lookat
+cam.lookat[:] = cam_lookat[0] if np.ndim(cam_lookat) == 2 else cam_lookat
 cam.azimuth, cam.elevation, cam.distance = cam_az, cam_el, cam_dist
 
 # kitchen extras: hold the dishwasher door open + rack out (the video's work phase)
@@ -88,18 +100,28 @@ if "dw_door_hinge" in jnames:
 frames = sorted(glob.glob(os.path.join(WORK, "frames", "f*.jpg")))
 n0 = int(round(T0 * FPS))
 n_frames = min(len(qpos), len(frames) - n0)
-wr = VideoWriter(OUTP, PW, PH * 2, FPS)
+HORIZ = os.environ.get("LAYOUT", "h") == "h"             # h: video | MuJoCo side by side
+AXIS = 1 if HORIZ else 0
+w0, h0 = Image.open(frames[0]).size                      # keep the source aspect ratio
+if HORIZ:
+    VW, VH = 2 * round(PH * w0 / h0 / 2), PH
+    wr = VideoWriter(OUTP, VW + PW, PH, FPS)
+else:
+    VW, VH = PW, 2 * round(PW * h0 / w0 / 2)
+    wr = VideoWriter(OUTP, PW, VH + PH, FPS)
 nq = min(36, qpos.shape[1])
 for i in range(n_frames):
-    top = np.asarray(Image.open(frames[n0 + i]).resize((PW, PH)), dtype=np.uint8)
+    top = np.asarray(Image.open(frames[n0 + i]).resize((VW, VH)), dtype=np.uint8)
     d.qpos[:] = 0.0
     d.qpos[:nq] = qpos[i, :nq]
     if adr_door is not None:
         d.qpos[adr_door] = DOOR_OPEN
         d.qpos[adr_rack] = RACK_OUT
     mujoco.mj_forward(m, d)
+    if np.ndim(cam_lookat) == 2:
+        cam.lookat[:] = cam_lookat[min(i, len(cam_lookat) - 1)]
     r.update_scene(d, camera=cam)
-    wr.write(np.concatenate([top, r.render()], 0))      # vertical: video / MuJoCo
+    wr.write(np.concatenate([top, r.render()], AXIS))
     if i % 1200 == 0:
         print(f"[replay] {i}/{n_frames}", flush=True)
 wr.close()

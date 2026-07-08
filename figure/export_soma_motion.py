@@ -86,8 +86,15 @@ def slerp_batch(Ra, Rb, t):
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else "motion_export.npz"
     outd = os.environ.get("MR_OUT", "mr_out")
-    fz = np.load(os.path.join(outd, "fit3d.npz"))
-    Jw, ok = fz["joints_w"][:, :18].astype(np.float64), fz["ok"].astype(bool)
+    # fit3d articulation carries SAM's smoothed-in mirror flickers; flicker-prone clips
+    # should pass MR_MOCAP_NPZ (chirality-corrected mocap [N,58,3] + ok, e.g. g1_targets.npz)
+    mocap = os.environ.get("MR_MOCAP_NPZ", "")
+    if mocap:
+        fz = np.load(mocap)
+        Jw, ok = fz["mocap"][:, :18].astype(np.float64), fz["ok"].astype(bool)
+    else:
+        fz = np.load(os.path.join(outd, "fit3d.npz"))
+        Jw, ok = fz["joints_w"][:, :18].astype(np.float64), fz["ok"].astype(bool)
 
     first, last = np.flatnonzero(ok)[0], np.flatnonzero(ok)[-1]
     Jw = Jw[first:last + 1]

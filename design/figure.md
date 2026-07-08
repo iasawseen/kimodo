@@ -438,7 +438,14 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   in place, which silently poisoned two earlier "results"). Optimization trace (MPJPE local):
   rotation-targets 19.8 cm → drop rotation targets 12.0 → drop leg heuristics 11.9 → static
   reachable arm targets 11.6 → **dynamic arm anchoring 9.8** → **dynamic legs 8.4 cm**
-  (p95 15.8, every bone direction ≤ 3.1°, heading 3.2°, foot skate 0.03 m/s).
+  (p95 15.8, every bone direction ≤ 3.1°, heading 3.2°, foot skate 0.03 m/s)
+  → **uniform target rescale to G1 size 4.18 cm** (p95 8.4; `SOMA_SCALE=auto`, the default:
+  pelvis-plateau → 0.72 m, applied to trajectory + articulation chain). What had looked like
+  a "morphology floor" was mostly reachability: targets lived at fit-world scale (figure
+  0.826 m pelvis, human subjects 0.93), so the IK chased a larger skeleton. Cross-scenario
+  (all local MPJPE, auto scale): figure 4.18 cm, xpeng walking 4.51 cm, vera_short (human,
+  fast dance turn) 6.2 cm — vera's residual heading error (13° mean / 50° p95) is turn lag,
+  not scale.
   The decisive idea: **dynamic anchoring** — child position targets (elbow/wrist, knee/ankle)
   are rebuilt EVERY IK iteration from the live parent link along the mocap bone directions
   with XML segment lengths. Static pre-computed targets assume each parent hits its own
@@ -456,6 +463,26 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   matched instead); G1 bends less than the Figure robot (waist ±0.52 rad; morphology); hands
   are rigid mittens vs the video's articulated fingers; ~10 % of walk frames keep ambiguous
   facing through pivots.
+- **NVIDIA soma-retargeter A/B** (fit -> SOMA BVH -> their Newton/Warp IK -> G1 CSV; bridge
+  modules `export_soma_bvh`/`import_soma_csv` in humanoid_motion_recon, all conventions
+  calibrated from their sample BVHs): local MPJPE figure 12.6 cm / xpeng 8.0 / vera 11.2
+  vs ours 4.2 / 4.5 / 6.2 on the same corrected mocap targets; heading xpeng 1.4 deg,
+  figure 14 / vera 18 (turn tails); foot skate 0.02 (matches ours). Four debugging lessons,
+  each isolated by a ROUND-TRIP harness (re-encode their own sample's joint positions
+  through our exporter, retarget, diff vs their reference CSV - final agreement 3.6 deg
+  mean DOF, so the format layer is provably faithful): (1) the SOMA Hips joint is NOT
+  mid-hip (sits ~8.5 cm above the hip line) - conflating them inflated the skeleton 9 %
+  and their proportional IK crouched + pitched 27 deg; (2) fit3d articulation (SAM mirror
+  flickers smoothed in) makes the robot pivot ~140 deg on mirrored stretches - export from
+  the chirality-corrected mocap (`MR_MOCAP_NPZ`, soma_retarget's Viterbi output); (3) limb
+  TWIST must be reference-anchored (`minrot(d_ref->d_meas) @ G_ref`) - anchoring at the
+  rig's zero orientation scrambles hip yaw ~150 deg because their IK reads link rotations
+  (round-trip DOF error 27.5 -> 3.6 deg); (4) their per-frame smoothing objective is tuned
+  on 120 fps SEED data - upsample the BVH to 120 fps (`BVH_FPS`, resample back on import)
+  or low-fps input over-smooths in wall time (xpeng heading 12.3 -> 1.4 deg). Residual gap
+  vs our retargeter: their IK executes the fit's bend-phase heel float literally
+  (single-leg lifts in the figure work phase) where our dynamic anchoring + ground clamp
+  absorb it, and fast turns keep p95 heading tails (~50-60 deg).
 
 ### 7.9 Mesh lifting + GPU rendering infrastructure
 
@@ -533,6 +560,6 @@ optimized **6.3×** (goal ≤8×):
   no bf16 kernel) runs but is no faster at batch 16 (50 vs 48 ms/f; CPU-side decode/transform
   dominates and TF32 already covers the fp32 matmuls) and adds 6 px / 8.8 mm deviation.
 - **Quality gate** (fast pipeline vs the full-quality reference fit on the same 1438 frames):
-  local inter-pipeline MPJPE **1.02 cm** (p95 1.87) — 8× below the retarget's own 8.4 cm
-  floor; kappa 1.258 vs 1.257; hip-line yaw diff 1.75°. Trajectory dev 7 cm mean reflects the
+  local inter-pipeline MPJPE **1.02 cm** (p95 1.87) — 4× below the retarget's own 4.18 cm
+  floor (§7.8); kappa 1.258 vs 1.257; hip-line yaw diff 1.75°. Trajectory dev 7 cm mean reflects the
   two runs' independent VGGT normalization chains (60 s vs 216 s), not pose degradation.
