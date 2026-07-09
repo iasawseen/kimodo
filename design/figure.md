@@ -446,6 +446,85 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   which is appearance-driven and chirality-reliable even when the 3D head mirrors. Result:
   vera 365/365-mirrored -> 335 raw + 30 leg-swap; figure 4932 raw + 38 lateral; raised-arm
   side verified against video frames on both scenarios (kp2d overlays + replay renders).
+  (Two later corrections, next bullet: vera's 30-frame leg-swap run was itself spurious —
+  the true vera assignment is 365/365 raw — and the "ankles 70%" figure conflated
+  witness-SILENT frames with disagreement; with the correct metric — both signs measurable
+  and opposite — vera's raw kp3d never disagrees with kp2d anywhere in the clip.)
+- **The locomotion unary is a PRIOR, not evidence — it must not outvote a silent witness**
+  (the vera "turned only at the joints" bug). User-visible failure: at t≈1.9–2.4 s the
+  replay root whipped 180° and back while both hip-yaw DOFs railed at −158° and waist yaw
+  −150° — the robot "turned without turning its body". Mechanism: the leg-swap state
+  negates the hip line (facing) as a side effect, and a corrected-mocap facing STEP is
+  unfollowable by the smoothed analytic root, so the IK dumps the whole 180° into hip/waist
+  yaw. Why the Viterbi picked it: during the shelf reach vera pulls back at 0.2–0.24 m/s —
+  just above the old 0.2 m/s walk gate — so raw paid ~18.7 of "walking backward"
+  anti-alignment while leg-swap's flipped facing explained the motion for free, against a
+  switch barrier of only ~7.4; the 2D witness could not defend raw because ankles+hips were
+  shelf-occluded (dead-banded to silence). Note pure-relabel states (whole-body/arm/leg
+  swap) are geometry-identical to raw — within-run continuity costs are IDENTICAL, only
+  transitions and unaries decide — so unary noise flips them freely. Fix (both in
+  `soma_retarget.py`): walk-evidence speed gate 0.2 → 0.35 m/s (weight shift and
+  reach-pullback are not locomotion), and a witness-silent prior W_REQ = 0.35/frame on the
+  pure-relabel states — only an ACTIVE kp2d witness on the state's relabeled pairs can
+  select a relabel. Cross-scenario after the fix: vera 365/365 raw, local MPJPE
+  7.28 → 6.08 cm, heading 3.19° → 1.58° mean (root sweeps smoothly through the real
+  t≈3.8–5.3 s turn; peak |hip yaw| 158° → 81°, waist 150° → 6°); figure 4.22 → 4.15 cm,
+  heading 3.12° (the raised gate also drops figure's 38 lateral-state frames — they were
+  low-speed walk-unary noise, not witness-backed; all three scenarios now resolve all-raw);
+  xpeng unchanged (141/141 raw, 4.8 cm). The NV-retargeter path improves too (vera heading
+  mean 35.2° → 19.7°; its residual fast-turn root lag is upstream). End-of-clip leg tangle
+  (last ~0.3 s, second person enters frame) is pre-existing SAM degradation, not the fix.
+- **"Retarget from the mesh" made literal: MHR `joint_global_rots` is the TWIST source**
+  (bone directions cannot see rotation about the bone, so limb twist, palm and head
+  orientation used to be whatever minrot/reference-locals left - the "random joint
+  rotations"). Three pieces:
+  (1) *Convention trap*: `mhr_head.py` flips positions into the kp3d camera frame
+  (`[..., [1, 2]] *= -1`) but exports `joint_global_rots` UNFLIPPED - conjugate by
+  `F = diag(1,-1,-1)`. Transport test (anchored delta carrying the reference bone
+  direction onto the measured one): 0-2° median per segment after conjugation, 20-105°
+  before. The missing conjugation is also why rig-rotation IK targets historically
+  evaluated net-negative (SOMA_W_TORSO/WRIST stay 0 by default, but the frame is fixed now).
+  (2) *Plumbing*: 15 main-chain joints (pelvis, chest, wrists, upper arms, forearms,
+  thighs, shins, feet, head; twist-helper doubles at identical positions rejected via the
+  TorchScript skeleton's `joint_parents`) cached F-conjugated in raw58, chirality-corrected
+  with the same Viterbi states (mirror = S R S conjugation, per-limb label swaps for the
+  relabel states), world-transformed, hemisphere-aligned quaternion box-smoothed, saved to
+  `g1_targets.npz` as `rots_w`/`rot_names`/`ref_n`.
+  (3) *Exporters, first attempt (superseded)*: folding the world-anchored mesh delta
+  `A(n) = Rw(n) @ Rw(ref)^T` under the minrot re-aim improved NV heading (19.7° → 8.4°
+  on vera) but was still HEADING-BLIND - see the next bullet for why and for the final
+  construction. The convention-trap fix and the rots_w plumbing above are what survive;
+  rots_w now feeds wrist pronation.
+- **Limb link twist must live in the consumer's rig convention, not the template's world
+  heading** (the vera "scarecrow arms + crouched legs" NV bug). Symptom: NVIDIA output
+  with arms flared horizontally and knees/ankles wrong across the WHOLE clip; the raw NV
+  CSV was railed from frame 0 (L_hip_yaw at exactly 158.0° = its limit, both ankle
+  pitches frozen at +30°, R elbow at 120°, knees +63° offset) - completely invisible to
+  the MPJPE/heading eval, because twist-class DOF errors barely move joint positions on
+  near-straight limbs (a railed hip yaw rotates the knee about its own axis). Root cause:
+  both minrot transport AND the A-delta scheme pin each limb segment's twist to the BVH
+  template's +Z facing - for near-vertical bones minrot is ~identity, so a subject whose
+  anchor stance faces ~180° from the template carries ~180° of twist on every limb link.
+  NVIDIA's retargeter consumes GLOBAL link orientations raw (hand r=1.2 is the strongest
+  arm rotation objective; foot orientation is consumed twice - main IK r=2.0 plus a
+  FeetStabilizer that slerps the ankle 100% to it and derives the knee bend plane from
+  it), then a JointLimitClamper pins the objective fight at exact limits.
+  Decisive evidence: a hard rig invariant in NVIDIA's own data - across all 10 sample
+  clips, ForeArm/Shin locals are EXACT pure positive-Z hinges (off-axis 0.00°), and at
+  the template reference the measured bend axis aligns +1.000 with segment-local +Z
+  (bone = ±X). Our old BVH had 100%-NEGATIVE Z with up to 83° X/Y leakage.
+  Fix (both exporters): build every limb segment frame from two measured vectors - bone
+  direction (matched exactly) + bend axis (cross of adjacent bone dirs; fixes the twist)
+  - which is heading-correct and rig-exact by construction; straight limbs blend toward
+  the torso-riding template axis by bend angle; hands ride the forearm plus a mesh
+  pronation twist about the forearm axis (from rots_w); elbow-bend floor kept. The
+  kimodo-npz exporter mirrors this with rig-derived rest axes (palms-down T-pose, read
+  from the relaxed-pose finger-curl axes: knees flex about +X - exported Shin locals
+  verify as pure positive-X hinges - elbows about -Y left / +Y right).
+  Acceptance: our BVH now satisfies their invariant exactly (ForeArm |X|=|Y|=0.00,
+  Z all-positive). Results: NV vera 16.0 → 8.0 cm local, heading 8.4° → 2.4° mean
+  (p95 6.7°), every railed DOF back to anatomical ranges (hip yaw ±28°, elbows
+  -13..+67°, ankles free); visually the robot finally stands/walks like the subject.
 - **Eval-driven convergence** (`eval_retarget.py`: mocap = corrected MotionRecon joints vs FK
   of the replay; MPJPE global/local, per-joint, bone directions, heading, lag, foot skate,
   10 s timeline; guards against stale artifacts — a crashed retarget leaves the previous csv
@@ -458,8 +537,8 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   a "morphology floor" was mostly reachability: targets lived at fit-world scale (figure
   0.826 m pelvis, human subjects 0.93), so the IK chased a larger skeleton. Cross-scenario
   (all local MPJPE, auto scale): figure 4.18 cm, xpeng walking 4.51 cm, vera_short (human,
-  fast dance turn) 6.2 cm — vera's residual heading error (13° mean / 50° p95) is turn lag,
-  not scale.
+  fast dance turn) 6.2 cm — vera's residual heading error (13° mean / 50° p95) was turn lag,
+  not scale (later reduced to 6.08 cm / 1.58° by the locomotion-prior fix above).
   The decisive idea: **dynamic anchoring** — child position targets (elbow/wrist, knee/ankle)
   are rebuilt EVERY IK iteration from the live parent link along the mocap bone directions
   with XML segment lengths. Static pre-computed targets assume each parent hits its own

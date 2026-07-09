@@ -64,21 +64,33 @@ KIDX70 = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 41, 62, 69] + \
     [b + 4 * f + j for b in (21, 42) for f in range(5) for j in range(4)]
 SWAP58 = SWAP18 + list(range(38, 58)) + list(range(18, 38))     # body swap + r-hand <-> l-hand
 
-# MHR rig joints for rotation targets, identified geometrically from joint_coords (stable
-# across frames): 1=pelvis (== global_rot), 112=chest/neck, 41=r wrist, 77=l wrist
-ROT_J = [1, 112, 41, 77]
+# MHR rig joints for rotation targets, identified from joint_coords + the skeleton's
+# joint_parents buffer (main-chain joints; coincident twist helpers rejected by hierarchy):
+# 1=pelvis (== global_rot), 112=chest/neck, 41=r wrist, 77=l wrist, arms r39/r40 l75/l76
+# (upperarm/forearm), legs l2/l3/l5 r18/r19/r21 (thigh/shin/foot), 113=head.
+# CONVENTION TRAP: mhr_head.py flips positions into the kp3d camera frame
+# ([..., [1, 2]] *= -1) but exports joint_global_rots UNFLIPPED - conjugate by
+# F=diag(1,-1,-1) to bring them into kp3d space. Transport test (R(n) @ R(ref)^T carrying
+# the reference bone direction onto the measured one): 0-2 deg median for every main
+# segment after conjugation vs 20-105 deg before. This missing conjugation is also why the
+# rig-rotation IK targets historically evaluated net-negative.
+ROT_NAMES = ["pelvis", "chest", "rwri", "lwri", "r_uparm", "r_forearm", "l_uparm",
+             "l_forearm", "l_thigh", "l_shin", "l_foot", "r_thigh", "r_shin", "r_foot",
+             "head"]
+ROT_J = [1, 112, 41, 77, 39, 40, 75, 76, 2, 3, 5, 18, 19, 21, 113]
+F_CAM = np.diag([1.0, -1.0, -1.0])
 # kp2d lateral-order pairs (SAM 70-joint indices): SAM's 2D head is appearance-driven and
 # chirality-reliable; its 3D head resolves depth separately and can mirror per frame.
 PAIRS70 = {"wri": (62, 41), "ank": (13, 14), "sho": (5, 6), "hip": (9, 10)}
 raw_cache = os.path.join(WORK, "raw58.npz")
 rc = np.load(raw_cache) if os.path.exists(raw_cache) else {}
-if "rel" in rc and "rots" in rc and "s2d" in rc:
+if "rel" in rc and "rots" in rc and "s2d" in rc and rc["rots"].shape[1] == len(ROT_J):
     rel_raw, ok_raw, rots_raw, s2d_raw = rc["rel"], rc["ok"], rc["rots"], rc["s2d"]
 else:
     import glob as _glob
     mfiles = sorted(_glob.glob(os.path.join(WORK, "mhr", "f*.npz")))
     rel_raw = np.full((N, 58, 3), np.nan, np.float32)
-    rots_raw = np.full((N, 4, 3, 3), np.nan, np.float32)
+    rots_raw = np.full((N, len(ROT_J), 3, 3), np.nan, np.float32)
     s2d_raw = np.zeros((N, 4), np.float32)              # sign of (l.x - r.x) in kp2d, with
     ok_raw = np.zeros(N, bool)                          # a 6 px dead-band -> 0 = no evidence
     for mf in mfiles:
@@ -92,7 +104,8 @@ else:
         midc = 0.5 * (k3[9] + k3[10])
         rel_raw[n] = (k3 - midc)[KIDX70]
         if "joint_rots" in mz.files:
-            rots_raw[n] = mz["joint_rots"][ROT_J].astype(np.float32)
+            rots_raw[n] = (F_CAM @ mz["joint_rots"][ROT_J].astype(np.float64)
+                           @ F_CAM).astype(np.float32)
         k2 = mz["kp2d"]
         for pi, (l, r) in enumerate(PAIRS70.values()):
             dx = float(k2[l, 0] - k2[r, 0])
@@ -191,7 +204,9 @@ cost = np.zeros((nfr, NS))
 for s_ in range(NS):
     f = FWD[s_][oki]
     ali = (f[:, :2] * vel[oki, :2]).sum(1) / (speed[oki] + 1e-9)
-    cost[:, s_] = np.where(speed[oki] > 0.2,
+    # gate at 0.35 m/s: below that is weight shift, not locomotion - pulling back from a
+    # reach reads as "walking backward" and this facing PRIOR must not outvote geometry
+    cost[:, s_] = np.where(speed[oki] > 0.35,
                            W_VEL * np.maximum(0.0, -ali) * np.minimum(speed[oki], 1.0), 0.0)
 cost[:, 2] += W_LAT                                     # x-flipping states are not strictly
 cost[:, 3] += W_LAT                                     # 2D-consistent: weak prior against
@@ -212,6 +227,18 @@ for s_ in range(NS):
     pred = s3d[oki] * sgn
     dis = (pred * s2d_raw[oki] < 0).astype(np.float32)  # both nonzero and opposite
     cost[:, s_] += dis @ W_2D
+# pure-relabel states (4/5/6) are geometry-identical to raw, so the ONLY evidence that can
+# legitimately select them is an ACTIVE 2D witness on their relabeled pairs. Where that
+# witness is silent (dead-band / occlusion), charge a weak per-frame prior so locomotion
+# noise cannot pick them: on vera, a 30-frame shelf reach (ankles+hips occluded, backward
+# weight shift) selected legswap, whose hip-line flip commands an instantaneous 180 deg
+# facing pulse - the smoothed root can't follow and IK rails hip/waist yaw at the limits.
+W_REQ = 0.35
+for s_ in (4, 5, 6):
+    act = np.zeros(nfr, bool)
+    for pi in RELAB[s_]:
+        act |= (s3d[oki, pi] != 0) & (s2d_raw[oki, pi] != 0)
+    cost[~act, s_] += W_REQ
 acc = cost[0].copy()
 back = np.zeros((nfr, NS), np.int8)
 for k in range(1, nfr):
@@ -285,19 +312,25 @@ S_OF = {1: np.diag([1.0, 1.0, -1.0]), 2: np.diag([-1.0, 1.0, 1.0]),
         3: np.diag([-1.0, 1.0, -1.0]),
         4: np.diag([-1.0, 1.0, 1.0]),                   # 4: body-sagittal mirror approx
         5: np.eye(3), 6: np.eye(3)}                     # 5/6: limb relabels, no reflection
-SWAP_WRISTS = {1, 2, 4, 5}                              # states that relabel the wrists
-rots_sel = rots_raw.astype(np.float64).copy()           # [N,4,3,3] (pelvis, chest, rwri, lwri)
+RI = {n_: i_ for i_, n_ in enumerate(ROT_NAMES)}
+ARM_RPAIRS = [(RI["rwri"], RI["lwri"]), (RI["r_uparm"], RI["l_uparm"]),
+              (RI["r_forearm"], RI["l_forearm"])]
+LEG_RPAIRS = [(RI["r_thigh"], RI["l_thigh"]), (RI["r_shin"], RI["l_shin"]),
+              (RI["r_foot"], RI["l_foot"])]
+SWAP_ARMS = {1, 2, 4, 5}                                # states that relabel the arm chain
+SWAP_LEGS = {1, 2, 4, 6}                                # states that relabel the leg chain
+rots_sel = rots_raw.astype(np.float64).copy()           # [N,len(ROT_J),3,3]
 for n in np.flatnonzero(state > 0):
-    S_M = S_OF[int(state[n])]
-    rp, rc_, rr, rl = rots_raw[n].astype(np.float64)
-    rots_sel[n, 0] = S_M @ rp @ S_M
-    rots_sel[n, 1] = S_M @ rc_ @ S_M
-    if int(state[n]) in SWAP_WRISTS:
-        rots_sel[n, 2] = S_M @ rl @ S_M                 # label swap: mirrored L drives R
-        rots_sel[n, 3] = S_M @ rr @ S_M
-    else:
-        rots_sel[n, 2] = S_M @ rr @ S_M
-        rots_sel[n, 3] = S_M @ rl @ S_M
+    s_n = int(state[n])
+    S_M = S_OF[s_n]
+    r_n = np.einsum("ij,qjk,kl->qil", S_M, rots_raw[n].astype(np.float64), S_M)
+    if s_n in SWAP_ARMS:
+        for a_, b_ in ARM_RPAIRS:                       # label swap: mirrored L drives R
+            r_n[[a_, b_]] = r_n[[b_, a_]]
+    if s_n in SWAP_LEGS:
+        for a_, b_ in LEG_RPAIRS:
+            r_n[[a_, b_]] = r_n[[b_, a_]]
+    rots_sel[n] = r_n
 # RELATIVE rotations, WORLD axes. Two failure modes bracketed this design: global deltas
 # double-count the chain (the analytic root already encodes torso lean -> waist clamps and
 # recruits yaw/roll, twisted bows); rig-local right-composed deltas assume the rig joint's
@@ -305,7 +338,33 @@ for n in np.flatnonzero(state > 0):
 # Convention-free form: the world-axes rotation from parent to child, Q = R_child @ R_parent^T;
 # transfer its delta vs the stand reference onto the G1's own per-frame parent.
 R_wc = R_c2w / np.cbrt(np.maximum(np.linalg.det(R_c2w), 1e-12))[:, None, None]
-rots_w = np.einsum("nkj,nqjm->nqkm", R_wc, rots_sel)    # [N,4,3,3] world (pelvis,chest,rw,lw)
+rots_w = np.einsum("nkj,nqjm->nqkm", R_wc, rots_sel)    # [N,J,3,3] world, ROT_NAMES order
+# fill non-ok frames from the nearest ok frame, then a short quaternion box smooth -
+# rots_w is persisted for the SOMA exporters (mesh-exact segment orientations; positions
+# stay the smoothed mocap, so exporters re-aim the swing and keep only the TWIST here)
+_g_ok = np.isfinite(rots_w.reshape(N, -1)).all(1)
+if _g_ok.any() and not _g_ok.all():
+    _gi = np.flatnonzero(_g_ok)
+    _ins = np.clip(np.searchsorted(_gi, np.arange(N)), 0, len(_gi) - 1)
+    _prv = _gi[np.clip(_ins - 1, 0, len(_gi) - 1)]
+    _nxt = _gi[_ins]
+    _pick = np.where(np.abs(_nxt - np.arange(N)) <= np.abs(np.arange(N) - _prv), _nxt, _prv)
+    rots_w = rots_w[_pick]
+from scipy.spatial.transform import Rotation as _Rot
+HAVE_ROTS = np.isfinite(rots_w).all()
+if HAVE_ROTS:
+    _q = _Rot.from_matrix(rots_w.transpose(1, 0, 2, 3).reshape(-1, 3, 3)).as_quat()
+    _q = _q.reshape(len(ROT_J), N, 4)
+    _par = np.cumsum((_q[:, 1:] * _q[:, :-1]).sum(-1) < 0, axis=1) % 2  # hemisphere align
+    _q[:, 1:][_par.astype(bool)] *= -1.0
+    _kq = 9
+    _qp = np.pad(_q, ((0, 0), (_kq // 2, _kq // 2), (0, 0)), mode="edge")
+    _q = sliding_window_view(_qp, _kq, axis=1).mean(-1)
+    _q = _q / np.linalg.norm(_q, axis=-1, keepdims=True)
+    rots_w = _Rot.from_quat(_q.reshape(-1, 4)).as_matrix() \
+        .reshape(len(ROT_J), N, 3, 3).transpose(1, 0, 2, 3)
+else:
+    print("[soma] WARNING: joint_rots missing/NaN; rots_w not exported")
 Q_chest = np.einsum("nkl,nml->nkm", rots_w[:, 1], rots_w[:, 0])   # chest @ pelvis^T
 Q_rwri = np.einsum("nkl,nml->nkm", rots_w[:, 2], rots_w[:, 1])    # r wrist @ chest^T
 Q_lwri = np.einsum("nkl,nml->nkm", rots_w[:, 3], rots_w[:, 1])
@@ -438,9 +497,12 @@ for sd, pre in (("l", "left"), ("r", "right")):
                f"{pre}_wrist_yaw_skel", f"{pre}_hand_roll_skel"):
         targets[:, IDX[wn]] = wri_t
 
+_rot_extra = {"rots_w": rots_w.astype(np.float32), "rot_names": np.array(ROT_NAMES),
+              "ref_n": np.int64(REF_N)} if HAVE_ROTS else {}
 np.savez_compressed(os.path.join(OUTD, "g1_targets.npz"), targets=targets.astype(np.float32),
                     ok=ok, t=tsec,
-                    mocap=Jw.astype(np.float32), state=state)  # corrected mocap for eval_retarget
+                    mocap=Jw.astype(np.float32), state=state,  # corrected mocap for eval_retarget
+                    **_rot_extra)  # world MHR segment rotations for the SOMA exporters
 
 # ---------------------------------------------------------------- 3. MuJoCo DLS IK
 m = mujoco.MjModel.from_xml_path(G1_XML)

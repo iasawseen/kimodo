@@ -8,10 +8,13 @@ reconstruction can be consumed anywhere Kimodo motions go (stitching, constraint
 Method: direction transfer onto the SOMA-77 rig. Torso joints get full two-vector frames
 (hip line + spine for Hips, shoulder line + spine for Chest, slerp between for Spine1/2;
 neck/head slerp toward a nose-up frame). Limb joints get minimal rotations aligning each
-rest bone direction to the measured fit3d bone direction (wrist/toe globals follow their
-parent - no twist source in an 18-joint fit). Fingers come from the rig's relaxed rest
-pose. posed_joints/global_rot_mats are produced by the rig's own FK from the exported
-locals, so the file is kinematically self-consistent by construction.
+rest bone direction to the measured fit3d bone direction. When MR_MOCAP_NPZ carries
+`rots_w` (world mesh-rig segment rotations + `rot_names`/`ref_n`, saved by soma_retarget),
+their anchored deltas are folded under the re-aim so limb TWIST, palm and head orientation
+follow the mesh; without them, wrist/toe globals ride their parent (no twist source in an
+18-joint fit). Fingers come from the rig's relaxed rest pose. posed_joints/global_rot_mats
+are produced by the rig's own FK from the exported locals, so the file is kinematically
+self-consistent by construction.
 
 Conventions (validated against a reference seed + the rig's rest pose):
     kimodo frame: Y-up, +Z forward, +X left  <-  MR world: Z-up, +X forward, +Y left
@@ -95,10 +98,21 @@ def main():
     else:
         fz = np.load(os.path.join(outd, "fit3d.npz"))
         Jw, ok = fz["joints_w"][:, :18].astype(np.float64), fz["ok"].astype(bool)
+    # MHR segment rotations (world, chirality-corrected by soma_retarget): the twist source.
+    # Bone directions cannot see twist about the bone; without these, limb twist and palm
+    # orientation are whatever minrot leaves (arbitrary).
+    Rw, RN, ref_n = None, None, 0
+    if "rots_w" in fz.files:
+        Rw = fz["rots_w"].astype(np.float64)
+        RN = {str(n): i for i, n in enumerate(fz["rot_names"])}
+        ref_n = int(fz["ref_n"])
+        print(f"[soma] MHR rotation twist source: {len(RN)} joints, anchor frame {ref_n}")
 
     first, last = np.flatnonzero(ok)[0], np.flatnonzero(ok)[-1]
     Jw = Jw[first:last + 1]
     T = len(Jw)
+    if Rw is not None:
+        Rw = Rw[first:last + 1]
     for j in range(18):                                    # interpolate interior gaps
         for c in range(3):
             v = Jw[:, j, c]
@@ -111,9 +125,15 @@ def main():
         t_dst = np.arange(int(t_src[-1] * FPS_OUT) + 1) / FPS_OUT
         Jw = np.stack([[np.interp(t_dst, t_src, Jw[:, j, c]) for c in range(3)]
                        for j in range(18)], 0).transpose(2, 0, 1)
+        if Rw is not None:
+            Rw = np.stack([Slerp(t_src, Rotation.from_matrix(Rw[:, j]))(t_dst).as_matrix()
+                           for j in range(Rw.shape[1])], 1)
         mesh_sel = np.clip(np.round(t_dst * FPS).astype(int), 0, T - 1)
         print(f"[soma] resampled {T} frames @ {FPS:.3f} fps -> {len(Jw)} @ {FPS_OUT:g} fps")
         T = len(Jw)
+    # rotation-anchor frame index in the (trimmed, resampled) timebase
+    ref_i = int(np.clip(round((ref_n - first) / FPS * (FPS_OUT or FPS)), 0, T - 1)) \
+        if FPS_OUT and abs(FPS - FPS_OUT) > 1e-3 else int(np.clip(ref_n - first, 0, T - 1))
 
     skel = build_skeleton(77)
     names = [n for n, _ in skel.bone_order_names_with_parents]
@@ -154,15 +174,71 @@ def main():
     G["Neck1"] = slerp_batch(G["Chest"], G["Head"], 1 / 3)
     G["Neck2"] = slerp_batch(G["Chest"], G["Head"], 2 / 3)
     G["LeftShoulder"], G["RightShoulder"] = G["Chest"], G["Chest"]
-    for S_, sh, el, wr in (("Left", "lsho", "lelb", "lwri"), ("Right", "rsho", "relb", "rwri")):
-        G[S_ + "Arm"] = minrot(np.tile(off_dir[S_ + "ForeArm"], (T, 1)), d(sh, el))
-        G[S_ + "ForeArm"] = minrot(np.tile(off_dir[S_ + "Hand"], (T, 1)), d(el, wr))
+
+    # limb segment frames: MEASURED bone direction (matched exactly) + MEASURED bend axis
+    # (fixes the twist). Rest bend axes from the rig itself (straight-limbed palms-down
+    # T-pose with identity locals; palm facing read off the relaxed-pose finger-curl
+    # axes): knees flex backward about +X (kimodo x = left; validated - exported Shin
+    # locals come out as pure positive-X hinges), elbows flex forward about -Y (left) /
+    # +Y (right). Heading-correct by construction - the previous rest-anchored minrot
+    # pinned limb twist to the rig's +Z facing, leaking the subject's world heading into
+    # local_rot_mats as limb-local twist (invisible in posed_joints, poison for any
+    # consumer that reads rotations). Straight limbs have no measurable bend axis: blend
+    # toward the torso-riding rest axis by bend angle.
+    EX = np.array([1.0, 0.0, 0.0])
+    A2_ARM = {"Left": np.array([0.0, -1.0, 0.0]), "Right": np.array([0.0, 1.0, 0.0])}
+
+    def limb_frame(a1, a2, b1, b2):
+        """R @ a1 = b1 exactly; R @ a2 ~ b2. a* fixed rest vectors, b* [T,3]."""
+        za = a_ = np.cross(a1, a2); za = a_ / np.linalg.norm(a_)
+        A_ = np.stack([a1, np.cross(za, a1), za], -1)
+        p = unit(b1)
+        z = unit(np.cross(p, b2))
+        B_ = np.stack([p, np.cross(z, p), z], -1)
+        return np.einsum("nij,kj->nik", B_, A_)
+
+    def bend_axis(d_par, d_chi, D_T, a_rest):
+        ax = np.cross(d_par, d_chi)
+        s = np.linalg.norm(ax, axis=1)
+        bend = np.degrees(np.arcsin(np.clip(s, 0.0, 1.0)))
+        ax_fb = np.einsum("nij,j->ni", D_T, a_rest)        # torso-riding rest axis
+        w = np.clip(bend / 15.0, 0.0, 1.0)[:, None]
+        ax_m = np.where(s[:, None] > 1e-8, ax / np.maximum(s, 1e-9)[:, None], ax_fb)
+        return unit(w * ax_m + (1.0 - w) * ax_fb)
+
+    # mesh wrist pronation (the one twist DOF bend-axis frames cannot see)
+    def pronation(p_):
+        if Rw is None or (p_ + "wri") not in RN or (p_ + "_forearm") not in RN:
+            return None
+        jf, jw = RN[p_ + "_forearm"], RN[p_ + "wri"]
+        R_rel = np.einsum("nji,njk->nik", Rw[:, jf], Rw[:, jw])
+        dR = np.einsum("nij,kj->nik", R_rel, R_rel[np.clip(ref_i, 0, T - 1)])
+        el, wr = ("lelb", "lwri") if p_ == "l" else ("relb", "rwri")
+        a = Jw[np.clip(ref_i, 0, T - 1), I[wr]] - Jw[np.clip(ref_i, 0, T - 1), I[el]]
+        a = Rw[np.clip(ref_i, 0, T - 1), jf].T @ (a / np.linalg.norm(a))
+        qq = Rotation.from_matrix(dR).as_quat()
+        tw = 2.0 * np.arctan2(qq[:, :3] @ a, qq[:, 3])
+        return (tw + np.pi) % (2 * np.pi) - np.pi
+
+    for S_, sh, el, wr, p_ in (("Left", "lsho", "lelb", "lwri", "l"),
+                               ("Right", "rsho", "relb", "rwri", "r")):
+        d_ua, d_fa = unit(d(sh, el)), unit(d(el, wr))
+        ax = bend_axis(d_ua, d_fa, G["Chest"], A2_ARM[S_])
+        G[S_ + "Arm"] = limb_frame(off_dir[S_ + "ForeArm"], A2_ARM[S_], d_ua, ax)
+        G[S_ + "ForeArm"] = limb_frame(off_dir[S_ + "Hand"], A2_ARM[S_], d_fa, ax)
         G[S_ + "Hand"] = G[S_ + "ForeArm"]
+        tw = pronation(p_)
+        if tw is not None:                                 # palm twist from the mesh
+            Rtw = Rotation.from_rotvec(d_fa * tw[:, None]).as_matrix()
+            G[S_ + "Hand"] = np.einsum("nij,njk->nik", Rtw, G[S_ + "ForeArm"])
     for S_, hp, kn, an, to in (("Left", "lhip", "lkne", "lank", "lbtoe"),
                                ("Right", "rhip", "rkne", "rank", "rbtoe")):
-        G[S_ + "Leg"] = minrot(np.tile(off_dir[S_ + "Shin"], (T, 1)), d(hp, kn))
-        G[S_ + "Shin"] = minrot(np.tile(off_dir[S_ + "Foot"], (T, 1)), d(kn, an))
-        G[S_ + "Foot"] = minrot(np.tile(off_dir[S_ + "ToeBase"], (T, 1)), d(an, to))
+        d_th, d_sh, d_ft = unit(d(hp, kn)), unit(d(kn, an)), unit(d(an, to))
+        axk = bend_axis(d_th, d_sh, G["Hips"], EX)
+        G[S_ + "Leg"] = limb_frame(off_dir[S_ + "Shin"], EX, d_th, axk)
+        G[S_ + "Shin"] = limb_frame(off_dir[S_ + "Foot"], EX, d_sh, axk)
+        axf = unit(axk - np.einsum("ni,ni->n", axk, d_ft)[:, None] * d_ft)
+        G[S_ + "Foot"] = limb_frame(off_dir[S_ + "ToeBase"], EX, d_ft, axf)
         G[S_ + "ToeBase"] = G[S_ + "Foot"]
 
     loc = skel.relaxed_hands_rest_pose.clone().float().unsqueeze(0).repeat(T, 1, 1, 1)
