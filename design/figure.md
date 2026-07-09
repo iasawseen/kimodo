@@ -17,7 +17,7 @@ per-lever control recipes (speed / step length / turns / EE constraints) this bu
 ## 0. Files
 
 `humanoid_motion_recon.*` entries live in the standalone sibling repo
-`../humanoid_motion_recon` (mono video → world skeletons + meshes; `pip install -e`'d into
+`../humanoid-motion-reconstruction` (mono video → world skeletons + meshes; `pip install -e`'d into
 both envs, run as `python -m humanoid_motion_recon.<tool>`). Its README is the pipeline
 doc; §7 here keeps the Figure-scenario findings.
 
@@ -38,7 +38,7 @@ doc; §7 here keeps the Figure-scenario findings.
 | `humanoid_motion_recon.skel_draw`, `humanoid_motion_recon.birdseye_video`, `humanoid_motion_recon.pose_over_cloud`, `humanoid_motion_recon.recon3d_video`, `humanoid_motion_recon.recon_check_video` | visualization / verification videos (§7.6) |
 | `figure/export_soma_motion.py` | fit3d (+ mesh) → Kimodo SOMA-77 motion npz (motion-seed schema: local/global rot mats, FK posed_joints, root, heading, foot contacts); direction-transfer retarget, validated round-trip vs a reference seed |
 | `figure/build_verify.sh` | rebuilds `outputs/figure/verify/` clips (video top / render bottom, time-synced) |
-| `outputs/figure/` | `figure.mp4` (symlink; source videos + recon render mp4s live in `../humanoid_motion_recon/videos/`), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
+| `outputs/figure/` | `figure.mp4` (symlink; source videos + recon render mp4s live in `../humanoid-motion-reconstruction/videos/`), `helix_kitchen.csv` (qpos [T,36]), `_bounds.json` (segment index), `kitchen_g1.xml`, `helix_kitchen_scene.json` (camera + solids), `helix_kitchen.mp4`, `pose/` (anchors + `lift3d.npz` / `fit3d.npz` + visualization mp4s), `verify/` |
 
 Run order (env per [gait.md](gait.md) §6):
 

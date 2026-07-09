@@ -1,13 +1,13 @@
 # humanoid_motion_recon vs the field: alternatives survey & design considerations
 
 Survey date: 2026-07-07 (multi-agent web sweep over papers/repos, adversarially gap-checked).
-Reference system throughout ("MR"): the standalone `../humanoid_motion_recon` package —
+Reference system throughout ("MR"): the standalone `../humanoid-motion-reconstruction` package —
 SAM-3D-Body (bbox-prompted per-frame MHR-70 keypoints + mesh + per-joint global rotations) +
 VGGT-Omega windowed depth (robust-affine stitched, moving cameras) + subject-calibrated world
 lift (torso-up, heels=floor, standing pelvis height = scale) + rigid fit + temporal smoothing.
 Measured profile: 6.3× real time on one RTX 3090 (9.3× with hand refinement), works on
 faceless humanoid robots, chirality corrected downstream (Viterbi), foot skate 0.03 m/s
-residual, no physics. Package docs: `../humanoid_motion_recon/README.md`; Figure-scenario
+residual, no physics. Package docs: `../humanoid-motion-reconstruction/README.md`; Figure-scenario
 findings: [figure.md](figure.md) §7.
 
 ## 1. The five families

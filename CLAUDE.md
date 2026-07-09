@@ -21,7 +21,7 @@ layers built on top of it:
   `design/figure.md` §0 is the file map and run order.
 - **MotionRecon** (mono video → world skeletons + meshes: SAM-3D-Body + VGGT-Omega + rigid
   fitter + smoother, plus all its torch-CUDA visualization renderers) now lives in the
-  standalone sibling repo `../humanoid_motion_recon` — `pip install -e`'d into both conda
+  standalone sibling repo `../humanoid-motion-reconstruction` — `pip install -e`'d into both conda
   envs; invoke as `python -m humanoid_motion_recon.<tool>` with the same env vars as before.
   Its README/CLAUDE.md are the authoritative pipeline docs; `design/figure.md` §7 keeps the
   Figure-scenario empirical findings.
