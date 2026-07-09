@@ -432,6 +432,20 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   t ≈ 12–190 s, so the replay's own work-phase median is the recon pocket
   (`kitchen_fit.json`'s pocket went stale when the reconstruction frame changed and put the
   robot ~9 m off-camera).
+- **Chirality is a per-LIMB, per-frame problem and SAM's 2D head is the reliable witness.**
+  The original 2-state Viterbi (raw / whole-body mirror) mirrored ALL of vera_short and 606
+  figure frames - visibly swapping left/right arms in every downstream retarget - because
+  SAM's wrong 3D interpretations are internally self-consistent: no internal anatomical
+  check (facing-vs-velocity, wrist-side-of-body) can catch a consistent mislabel, and
+  whole-body mirrors cannot fix SAM's per-limb failures at all. Measured kp3d-vs-kp2d
+  lateral agreement: figure 98-100% everywhere (SAM's 3D was right; the mirrors were OUR
+  error), vera wrists 98% but ankles 70% (per-frame leg-only flips). The fix in
+  `soma_retarget.py`: 7 hypotheses (raw, swap+z-mirror, swap+x-mirror, yaw-180, whole-body
+  label swap, ARM-pair swap, LEG-pair swap) + a per-frame 2D-witness unary scoring each
+  hypothesis's predicted image lateral order (wri/ank/sho/hip, dead-banded) against kp2d,
+  which is appearance-driven and chirality-reliable even when the 3D head mirrors. Result:
+  vera 365/365-mirrored -> 335 raw + 30 leg-swap; figure 4932 raw + 38 lateral; raised-arm
+  side verified against video frames on both scenarios (kp2d overlays + replay renders).
 - **Eval-driven convergence** (`eval_retarget.py`: mocap = corrected MotionRecon joints vs FK
   of the replay; MPJPE global/local, per-joint, bone directions, heading, lag, foot skate,
   10 s timeline; guards against stale artifacts — a crashed retarget leaves the previous csv

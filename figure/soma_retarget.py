@@ -67,16 +67,20 @@ SWAP58 = SWAP18 + list(range(38, 58)) + list(range(18, 38))     # body swap + r-
 # MHR rig joints for rotation targets, identified geometrically from joint_coords (stable
 # across frames): 1=pelvis (== global_rot), 112=chest/neck, 41=r wrist, 77=l wrist
 ROT_J = [1, 112, 41, 77]
+# kp2d lateral-order pairs (SAM 70-joint indices): SAM's 2D head is appearance-driven and
+# chirality-reliable; its 3D head resolves depth separately and can mirror per frame.
+PAIRS70 = {"wri": (62, 41), "ank": (13, 14), "sho": (5, 6), "hip": (9, 10)}
 raw_cache = os.path.join(WORK, "raw58.npz")
 rc = np.load(raw_cache) if os.path.exists(raw_cache) else {}
-if "rel" in rc and "rots" in rc:
-    rel_raw, ok_raw, rots_raw = rc["rel"], rc["ok"], rc["rots"]
+if "rel" in rc and "rots" in rc and "s2d" in rc:
+    rel_raw, ok_raw, rots_raw, s2d_raw = rc["rel"], rc["ok"], rc["rots"], rc["s2d"]
 else:
     import glob as _glob
     mfiles = sorted(_glob.glob(os.path.join(WORK, "mhr", "f*.npz")))
     rel_raw = np.full((N, 58, 3), np.nan, np.float32)
     rots_raw = np.full((N, 4, 3, 3), np.nan, np.float32)
-    ok_raw = np.zeros(N, bool)
+    s2d_raw = np.zeros((N, 4), np.float32)              # sign of (l.x - r.x) in kp2d, with
+    ok_raw = np.zeros(N, bool)                          # a 6 px dead-band -> 0 = no evidence
     for mf in mfiles:
         n = int(os.path.basename(mf)[1:6])
         if n >= N:
@@ -89,14 +93,47 @@ else:
         rel_raw[n] = (k3 - midc)[KIDX70]
         if "joint_rots" in mz.files:
             rots_raw[n] = mz["joint_rots"][ROT_J].astype(np.float32)
+        k2 = mz["kp2d"]
+        for pi, (l, r) in enumerate(PAIRS70.values()):
+            dx = float(k2[l, 0] - k2[r, 0])
+            s2d_raw[n, pi] = np.sign(dx) if abs(dx) > 6.0 else 0.0
         ok_raw[n] = True
-    np.savez_compressed(raw_cache, rel=rel_raw, ok=ok_raw, rots=rots_raw)
-    print(f"[soma] cached raw58 rel offsets + rig rotations -> {raw_cache}")
+    np.savez_compressed(raw_cache, rel=rel_raw, ok=ok_raw, rots=rots_raw, s2d=s2d_raw)
+    print(f"[soma] cached raw58 rel offsets + rig rotations + kp2d signs -> {raw_cache}")
 ok &= ok_raw
 
-# mirrored hypothesis: L/R label swap + depth mirror about the pelvis (z=0 in rel coords)
-rel_mir = rel_raw[:, SWAP58].copy()
-rel_mir[:, :, 2] *= -1.0
+# hypothesis family. SAM's chirality errors on symmetric faceless subjects come in TWO
+# mirror modes: the front/back mirage (fix = L/R label swap + depth flip about the pelvis)
+# and the LATERAL mirror (SAM yaws a back-facing body so the wrong arm projects onto the
+# image limb; fix = label swap + camera-x flip - only 2D-consistent for symmetric
+# appearances, which these robots are). With both flips composed (yaw-180, no swap) the
+# family closes: 4 states.
+rel_h = [rel_raw]
+_m = rel_raw[:, SWAP58].copy(); _m[:, :, 2] *= -1.0
+rel_h.append(_m)                                        # 1: swap + z-flip (front/back)
+_m = rel_raw[:, SWAP58].copy(); _m[:, :, 0] *= -1.0
+rel_h.append(_m)                                        # 2: swap + x-flip (lateral)
+_m = rel_raw.copy(); _m[:, :, 0] *= -1.0; _m[:, :, 2] *= -1.0
+rel_h.append(_m)                                        # 3: yaw-180 (proper rotation)
+rel_h.append(rel_raw[:, SWAP58].copy())                 # 4: whole-body label swap
+# 5: ARM-pair swap only. On back-facing symmetric robots SAM keeps the hips/facing right
+# (raw facing tracks the camera-derived truth within ~26 deg) but CROSSES THE ARMS - its
+# "right" arm reaches to the image limb that is anatomically the subject's left. Fix =
+# relabel arm joints (+ hand blocks), positions untouched (fully 2D-consistent); hip-line
+# is identical to raw so facing evidence never fights it, and limb continuity at crossing
+# onsets (a mislabeled wrist teleports ~1 m mid-reach) picks the switch point.
+ARMSW = list(range(58))
+for a, b in ((1, 2), (3, 4), (16, 15)):                 # lsho/rsho, lelb/relb, lwri/rwri
+    ARMSW[a], ARMSW[b] = ARMSW[b], ARMSW[a]
+ARMSW[18:38], ARMSW[38:58] = ARMSW[38:58], ARMSW[18:38]  # hand blocks
+rel_h.append(rel_raw[:, ARMSW].copy())
+# 6: LEG-pair swap (same per-limb failure mode for the legs; on some clips SAM's 3D legs
+# disagree with its own 2D on ~30% of frames while the arms are fine)
+LEGSW = list(range(58))
+for a, b in ((5, 6), (7, 8), (9, 10), (11, 13), (12, 14)):   # hip/kne/ank/btoe/heel
+    LEGSW[a], LEGSW[b] = LEGSW[b], LEGSW[a]
+rel_h.append(rel_raw[:, LEGSW].copy())
+NS = 7
 
 # world scale/orientation chain from the fit (a = offset ratio, kappa = body-size calib)
 a_s = fz["a"].astype(np.float64)
@@ -120,8 +157,7 @@ if abs(F_SC - 1.0) > 1e-6:
     R_c2w = R_c2w * F_SC                                 # scale rides the c2w affine
     print(f"[soma] SOMA_SCALE={_sc}: x{F_SC:.3f} to G1 pelvis scale")
 
-off_raw = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_raw)
-off_mir = kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * rel_mir)
+off_h = [kappa * np.einsum("nij,nkj->nki", R_c2w, a_s[:, None, None] * r) for r in rel_h]
 
 # smoothed, mirror-invariant trajectory + velocity from fit3d
 mid = 0.5 * (Jw_fit[:, K["lhip"]] + Jw_fit[:, K["rhip"]])
@@ -139,40 +175,67 @@ def _fwd(off):
         l / (np.linalg.norm(l, axis=1, keepdims=True) + 1e-9)
 
 
-FWD = [None, None]; HIP = [None, None]
-FWD[0], HIP[0] = _fwd(off_raw)
-FWD[1], HIP[1] = _fwd(off_mir)
+FWD = [None] * NS; HIP = [None] * NS
+for s_ in range(NS):
+    FWD[s_], HIP[s_] = _fwd(off_h[s_])
+# limb anchor points per state (branch swaps teleport wrists/ankles ~0.5 m frame-to-frame -
+# far stronger evidence than the hip line, which barely moves between mirror branches)
+LIMBS = [K["lwri"], K["rwri"], K["lank"], K["rank"]]
+limb_h = [off_h[s_][:, LIMBS] for s_ in range(NS)]
 
-# global 2-state Viterbi over the flip sequence
+# global 4-state Viterbi over the hypothesis sequence
 oki = np.flatnonzero(ok)
 nfr = len(oki)
-W_VEL, W_SW = 4.0, 1.5
-cost = np.zeros((nfr, 2))
-for s in (0, 1):
-    f = FWD[s][oki]
+W_VEL, W_SW, W_LIMB, W_LAT = 4.0, 1.5, 2.0, 0.05
+cost = np.zeros((nfr, NS))
+for s_ in range(NS):
+    f = FWD[s_][oki]
     ali = (f[:, :2] * vel[oki, :2]).sum(1) / (speed[oki] + 1e-9)
-    cost[:, s] = np.where(speed[oki] > 0.2,
-                          W_VEL * np.maximum(0.0, -ali) * np.minimum(speed[oki], 1.0), 0.0)
+    cost[:, s_] = np.where(speed[oki] > 0.2,
+                           W_VEL * np.maximum(0.0, -ali) * np.minimum(speed[oki], 1.0), 0.0)
+cost[:, 2] += W_LAT                                     # x-flipping states are not strictly
+cost[:, 3] += W_LAT                                     # 2D-consistent: weak prior against
+# 2D-agreement unary: SAM's 2D head is the reliable chirality witness. Per pair
+# (wri/ank/sho/hip), the state's predicted image lateral order = raw kp3d order, sign
+# flipped by (pair relabeled XOR camera-x flipped). Disagreement with kp2d costs.
+K58 = {"wri": (16, 15), "ank": (9, 10), "sho": (1, 2), "hip": (5, 6)}   # (l, r) in KPN58
+s3d = np.zeros((N, 4), np.float32)
+for pi, (l, r) in enumerate(K58.values()):
+    dx3 = rel_raw[:, l, 0] - rel_raw[:, r, 0]
+    s3d[:, pi] = np.sign(dx3) * (np.abs(dx3) > 0.02)
+XFLIP = {2, 3}
+RELAB = {0: set(), 1: {0, 1, 2, 3}, 2: {0, 1, 2, 3}, 3: set(), 4: {0, 1, 2, 3},
+         5: {0, 2}, 6: {1, 3}}                          # pair indices relabeled per state
+W_2D = np.array([1.0, 0.8, 0.6, 0.6])                  # wrists strongest (98% reliable)
+for s_ in range(NS):
+    sgn = np.array([-1.0 if ((pi in RELAB[s_]) ^ (s_ in XFLIP)) else 1.0 for pi in range(4)])
+    pred = s3d[oki] * sgn
+    dis = (pred * s2d_raw[oki] < 0).astype(np.float32)  # both nonzero and opposite
+    cost[:, s_] += dis @ W_2D
 acc = cost[0].copy()
-back = np.zeros((nfr, 2), np.int8)
+back = np.zeros((nfr, NS), np.int8)
 for k in range(1, nfr):
     n, p = oki[k], oki[k - 1]
-    new = np.empty(2)
-    for s in (0, 1):
-        cont = [1.0 - float(HIP[s][n] @ HIP[sp][p]) for sp in (0, 1)]
-        tr = [acc[sp] + cont[sp] + (W_SW if s != sp else 0.0) for sp in (0, 1)]
-        back[k, s] = int(np.argmin(tr))
-        new[s] = min(tr) + cost[k, s]
+    new = np.empty(NS)
+    for s_ in range(NS):
+        tr = [acc[sp] + (1.0 - float(HIP[s_][n] @ HIP[sp][p]))
+              + W_LIMB * float(np.linalg.norm(limb_h[s_][n] - limb_h[sp][p], axis=1).mean())
+              + (W_SW if s_ != sp else 0.0) for sp in range(NS)]
+        back[k, s_] = int(np.argmin(tr))
+        new[s_] = min(tr) + cost[k, s_]
     acc = new
-flip = np.zeros(N, bool)
+state = np.zeros(N, np.int8)
 s = int(np.argmin(acc))
 for k in range(nfr - 1, -1, -1):
-    flip[oki[k]] = bool(s)
+    state[oki[k]] = s
     s = int(back[k, s])
-print(f"[soma] chirality (raw, hypothesis-select): {int(flip[oki].sum())}/{nfr} frames mirrored")
+cnt = [int((state[oki] == s_).sum()) for s_ in range(NS)]
+print(f"[soma] chirality (7-hyp): raw/zmir/xmir/yaw180/lblswap/armswap/legswap = {cnt} of {nfr}")
 
 # corrected world offsets, THEN temporal smoothing (safe post-correction), + fit3d trajectory
-off_c = np.where(flip[:, None, None], off_mir, off_raw)
+off_all = np.stack(off_h, 0)                            # [S,N,58,3]
+off_c = np.take_along_axis(off_all, state[None, :, None, None].astype(np.intp),
+                           axis=0)[0]
 from numpy.lib.stride_tricks import sliding_window_view
 flat = off_c.reshape(N, -1)
 for c in range(flat.shape[1]):
@@ -202,15 +265,23 @@ if w.sum() > 10:
 # about the bone (all 3 wrist dofs) and true torso orientation. Chirality: the mirror of a
 # rotation across the camera z-plane is the reflection conjugate S R S (S = diag(1,1,-1)),
 # plus L/R label swap for the wrists; applied per frame from the SAME Viterbi flips.
-S_MIR = np.diag([1.0, 1.0, -1.0])
+S_OF = {1: np.diag([1.0, 1.0, -1.0]), 2: np.diag([-1.0, 1.0, 1.0]),
+        3: np.diag([-1.0, 1.0, -1.0]),
+        4: np.diag([-1.0, 1.0, 1.0]),                   # 4: body-sagittal mirror approx
+        5: np.eye(3), 6: np.eye(3)}                     # 5/6: limb relabels, no reflection
+SWAP_WRISTS = {1, 2, 4, 5}                              # states that relabel the wrists
 rots_sel = rots_raw.astype(np.float64).copy()           # [N,4,3,3] (pelvis, chest, rwri, lwri)
-fl = np.flatnonzero(flip)
-for n in fl:
+for n in np.flatnonzero(state > 0):
+    S_M = S_OF[int(state[n])]
     rp, rc_, rr, rl = rots_raw[n].astype(np.float64)
-    rots_sel[n, 0] = S_MIR @ rp @ S_MIR
-    rots_sel[n, 1] = S_MIR @ rc_ @ S_MIR
-    rots_sel[n, 2] = S_MIR @ rl @ S_MIR                 # label swap: mirrored L drives R
-    rots_sel[n, 3] = S_MIR @ rr @ S_MIR
+    rots_sel[n, 0] = S_M @ rp @ S_M
+    rots_sel[n, 1] = S_M @ rc_ @ S_M
+    if int(state[n]) in SWAP_WRISTS:
+        rots_sel[n, 2] = S_M @ rl @ S_M                 # label swap: mirrored L drives R
+        rots_sel[n, 3] = S_M @ rr @ S_M
+    else:
+        rots_sel[n, 2] = S_M @ rr @ S_M
+        rots_sel[n, 3] = S_M @ rl @ S_M
 # RELATIVE rotations, WORLD axes. Two failure modes bracketed this design: global deltas
 # double-count the chain (the analytic root already encodes torso lean -> waist clamps and
 # recruits yaw/roll, twisted bows); rig-local right-composed deltas assume the rig joint's
