@@ -479,9 +479,12 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   facing through pivots.
 - **NVIDIA soma-retargeter A/B** (fit -> SOMA BVH -> their Newton/Warp IK -> G1 CSV; bridge
   modules `export_soma_bvh`/`import_soma_csv` in humanoid_motion_recon, all conventions
-  calibrated from their sample BVHs): local MPJPE figure 12.6 cm / xpeng 8.0 / vera 11.2
-  vs ours 4.2 / 4.5 / 6.2 on the same corrected mocap targets; heading xpeng 1.4 deg,
-  figure 14 / vera 18 (turn tails); foot skate 0.02 (matches ours). Four debugging lessons,
+  calibrated from their sample BVHs): local MPJPE figure 16.8 cm / xpeng 8.0 / vera 15.9
+  vs ours 4.2 / 4.5 / 7.3 on the same corrected mocap targets; heading xpeng 1.4 deg vs
+  ours 3.4 / 3.2. Their dominant residual is a CONSTANT ~24 deg work-phase yaw offset:
+  the feet-stabilized root undershoots the fast walk-in pivot and never recovers once
+  feet pin (pre-chirality-fix numbers looked better only because the mirrored walk-in
+  made the apparent pivot smaller). Foot skate 0.02 (matches ours). Four debugging lessons,
   each isolated by a ROUND-TRIP harness (re-encode their own sample's joint positions
   through our exporter, retarget, diff vs their reference CSV - final agreement 3.6 deg
   mean DOF, so the format layer is provably faithful): (1) the SOMA Hips joint is NOT

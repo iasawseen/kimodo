@@ -251,6 +251,22 @@ for c in range(flat.shape[1]):
     v[m] = vi[m]
 Jw = mid_i[:, None] + off_c
 
+# depth-drift guard: monocular depth drifts under camera pans (measured +10% body depth
+# over the last second of a panning clip), inflating the subject so its pelvis exceeds the
+# subject's OWN standing height - anatomically impossible while walking, and the retarget
+# saturates into straight-legged floating. Compress the impossible excess about the floor
+# (the error is scale inflation, so scaling z back is the right correction; heels stay put).
+_pz = 0.5 * (Jw[:, K["lhip"], 2] + Jw[:, K["rhip"], 2])
+_pzf = _pz[np.isfinite(_pz)]
+_cap = float(np.median(_pzf[_pzf > np.percentile(_pzf, 85) * 0.97])) * 1.01
+_g = np.minimum(1.0, _cap / np.where(np.isfinite(_pz) & (_pz > 1e-6), _pz, _cap))
+_k = int(2 * round(0.25 * FPS / 2) + 1)                 # smooth the gain, ~0.5 s
+_g = np.convolve(np.pad(_g, (_k // 2, _k // 2), mode="edge"), np.ones(_k) / _k, "valid")
+if (_g < 0.999).any():
+    print(f"[soma] depth-drift guard: pelvis cap {_cap:.3f}, min gain {_g.min():.3f} "
+          f"on {(int((_g < 0.999).sum()))} frames")
+    Jw[:, :, 2] *= _g[:, None]
+
 # acceptance metric: corrected forward vs velocity on walking frames
 fwd_c, _ = _fwd(off_c)
 w = ok & (speed > 0.3)
@@ -424,7 +440,7 @@ for sd, pre in (("l", "left"), ("r", "right")):
 
 np.savez_compressed(os.path.join(OUTD, "g1_targets.npz"), targets=targets.astype(np.float32),
                     ok=ok, t=tsec,
-                    mocap=Jw.astype(np.float32), flip=flip)   # corrected mocap for eval_retarget
+                    mocap=Jw.astype(np.float32), state=state)  # corrected mocap for eval_retarget
 
 # ---------------------------------------------------------------- 3. MuJoCo DLS IK
 m = mujoco.MjModel.from_xml_path(G1_XML)

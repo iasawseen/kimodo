@@ -169,3 +169,54 @@ NeurIPS 24) · SLAHMR <https://github.com/vye16/slahmr> · Sapiens (Meta, ECCV 2
   scenario (vera), re-render a kitchen replay for visual sanity, then adopt 448.
 - Default (non-auto) pipeline verified unregressed after all changes: gate PASS at 0.78 cm,
   kappa 1.257 exact.
+
+## 9. MotionRecon-RT: real-time variant for humanoid teleoperation (design sketch, 2026-07-09)
+
+Question: can the pipeline reach real time to teleoperate a physical humanoid? Answer: yes,
+but by re-architecting for the teleop setting, not by optimizing the batch pipeline. The
+batch system solves the hard uncontrolled problem (unknown moving camera, faceless robot
+subjects, offline); teleop is the easy controlled version. Three batch components are
+structurally ACAUSAL, not just slow — VGGT's 160-frame stitched windows, whole-clip
+calibration voting, global chirality Viterbi + acausal smoothing — so 1x is unreachable by
+kernel work alone.
+
+### What the controlled setting deletes
+
+| Component | Batch (uncontrolled) | Teleop station | Latency |
+|---|---|---|---|
+| Depth/scale | VGGT-Omega windows (~60% of compute) | gone: static calibrated camera, or RGB-D, or one-time scale calibration | ~0 |
+| World calibration | MR_AUTO whole-clip voting | 2-s operator T-pose at session start | one-time |
+| Pose | SAM-3D-Body 153 ms/f single-frame (48 ms/f batched adds delay) | same model TRT/FP16, or an RTMW3D-class light estimator | 15–50 ms |
+| Chirality | 7-hypothesis Viterbi (global) | cooperative front-facing human; 2D-witness unary ports to a causal filter with hysteresis | ~0 |
+| Smoothing | acausal box/SG | one-euro filter | +1 frame |
+| Retarget IK | DLS ~30 ms/f cold | warm-started per frame (1–2 iters converge) | 2–5 ms |
+
+End-to-end estimate: camera+encode 30–50 ms, pose 20–50 ms, causal fit + IK ~5 ms →
+**~100–150 ms glass-to-joint-reference at 30 Hz on one consumer GPU**. Squarely in the
+demonstrated envelope (H2O / OmniH2O, HumanPlus do real-time RGB whole-body teleop with
+this architecture shape) — engineering risk, not research risk.
+
+### What carries over from this stack
+
+- The retarget layer as-is: direction transfer + dynamic anchoring, self-measured scale
+  normalization (SOMA_SCALE), ground clamp, depth-drift guard, G1 joint mapping.
+- The eval harness (MPJPE / heading / skate) repurposed as a LIVE teleop-quality monitor.
+- The SOMA/BVH export path: teleop sessions log as SEED-format demonstrations for free —
+  a data-collection byproduct worth having on its own.
+
+### What is genuinely new work
+
+A real robot cannot consume open-loop qpos. The 30 Hz retargeted references feed a
+whole-body tracking controller (H2O-style RL policy or MPC) handling balance/feasibility
+at 500 Hz+, plus safety clamps: joint velocity/workspace limits, fall-arrest, e-stop on
+tracking divergence (the live eval monitor is the natural trigger signal). The
+perception-to-reference chain itself is days-to-weeks of assembly.
+
+### Session protocol (proposed)
+
+1. Static camera (or RGB-D) fixed at the operator station; intrinsics known.
+2. Operator T-pose 2 s: floor plane from ankles, scale from pelvis height, yaw from
+   shoulder line — the MR_AUTO measurements, computed once, then frozen.
+3. Stream: detect/track box -> pose (TRT) -> causal chirality filter (2D-witness +
+   hysteresis) -> one-euro smoothing -> scale-normalized direction-transfer retarget with
+   warm-started IK -> 30 Hz reference stream + live quality monitor -> tracking policy.
