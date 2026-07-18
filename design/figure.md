@@ -601,7 +601,16 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   elbow_pitch_link but r_body → elbow_yaw_link. Output tracks the G1 reference tightly
   (path-length ratio = Hips-scale ratio exactly); where Chel lacks G1's range (hip pitch
   −77 vs −108, no waist pitch) their limit-clamped IK converts the source's deep waist
-  bend into a knees-bent crouch — morphologically correct. Renderers are now
+  bend into a knees-bent crouch — morphologically correct. ARM-TWIST TRAP (cost a day):
+  map the ForeArm ORIENTATION target to the link BEFORE the robot's forearm-roll DOF
+  (chel: r_body = elbow_PITCH_link, not elbow_yaw_link) — G1's own ik_map targets
+  elbow_link, upstream of its wrist_roll. Placed after the roll, the SOMA ForeArm
+  frame's posture-varying twist directly commands the forearm roll and the IK winds
+  shoulder_yaw vs elbow_yaw +/-60-90 deg against each other (palms-back scarecrow
+  hands; worst on straight-arm subjects); no offset recalibration, init pose, weight,
+  mask or joint-limit change can fix a structurally misplaced target. Arm joint_scales
+  must be SEGMENT-LENGTH ratios (chel/soma chain = 0.954), never radial-at-pose values
+  from a calibration posture. Renderers are now
   robot-generic (`ROBOT_XML`, replay `LOOKAT_Z`); for NV-soma trajectories the overlay
   scale must be the chain-consistent `SOMA_HIPS_SCALE` (effective NV Hips scale:
   G1 0.7744, Chel 0.883 -> F_SC = 0.918 template-midhip x hips-scale / plateau). The
