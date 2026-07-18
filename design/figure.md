@@ -580,6 +580,76 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   vs our retargeter: their IK executes the fit's bend-phase heel float literally
   (single-leg lifts in the figure work phase) where our dynamic anchoring + ground clamp
   absorb it, and fast turns keep p95 heading tails (~50-60 deg).
+- **Custom target robot on their pipeline — Chel (sberchel v3.0.4, models-hub) worked
+  first try** (vera_short; bundle preserved in `outputs/chel/`: `model/` = open-chain
+  MJCF + meshes + build scripts, `chel_nv/` = NV asset/configs/driver/calibration).
+  Their `robot_type` is hard-frozen to `"unitree_g1"` and the MJCF comes from
+  `newton.utils.download_asset` — monkeypatch that to return a custom asset root holding
+  `mjcf/g1_29dof_rev_1_0.xml`; all config JSONs accept absolute paths. Hard requirement:
+  newton `body_count == joint_count` with body i = child of joint i — Chel's 164-body
+  open-chain model must be collapsed to a geometry-free 30-body skeleton (compose the
+  fixed transforms of jointless intermediate bodies into each joint-child body;
+  FK-verified vs the full model at machine epsilon). Calibration procedure (validated by
+  reproducing NVIDIA's shipped G1 scaler values, mean 3.1 deg residual; wrong-hypothesis
+  separation ~90 deg): `q_offset = inv(q_soma_zero_frame0_converted) * Rz(-90) *
+  q_link_stand_fk` (xyzw; Rz(-90) aligns the robot's +X facing to the converted SOMA
+  zero's -Y), scales = radial ratios |p_link − p_root| / |p_soma − p_root| with
+  `model_height: 1.8`. TRAP: their `soma_zero_frame0.bvh` has elbows bent 90 deg
+  (matches G1's MJCF zero, forearms forward) — for an arms-straight robot like Chel,
+  compute ForeArm/Hand offsets against an elbow-matched FK pose (elbow_pitch = −90) or
+  every arm motion lands 90 deg backward. Chel's split elbow maps ForeArm t_body →
+  elbow_pitch_link but r_body → elbow_yaw_link. Output tracks the G1 reference tightly
+  (path-length ratio = Hips-scale ratio exactly); where Chel lacks G1's range (hip pitch
+  −77 vs −108, no waist pitch) their limit-clamped IK converts the source's deep waist
+  bend into a knees-bent crouch — morphologically correct. Renderers are now
+  robot-generic (`ROBOT_XML`, replay `LOOKAT_Z`); for NV-soma trajectories the overlay
+  scale must be the chain-consistent `SOMA_HIPS_SCALE` (effective NV Hips scale:
+  G1 0.7744, Chel 0.883 -> F_SC = 0.918 template-midhip x hips-scale / plateau). The
+  `ROBOT_STAND_Z`/plateau fallback equates robot ROOT with subject MID-HIP — the SOMA
+  Hips joint sits 8.5 cm above the hip line, so it shrank Chel and its walked path ~9%
+  (depth lag -> ghost read small + floating on xpeng). The overlay also RIDES THE
+  SUBJECT'S GROUND, not the fit's z=0 (`FLOOR_TRACK=0` to disable): the fit floor is
+  calibrated once and can sit wrong for the rest of the clip — xpeng's fit heels ride
+  0.17-0.25 m BELOW z=0 throughout, so a z=0-standing ghost hovered at the robot's
+  shins even with correct scale. Per-frame min-heel z (~0.8 s box smooth) is the
+  local ground level; the ghost's z=0 plane rides it. Overlay quality knobs: `UPSCALE`
+  (render at N x the processed-frame size with all intrinsics scaled - the xpeng SOURCE
+  is only 480x540, so its overlays render at 2x with the ghost rasterized sharp),
+  `CQ` (NVENC quality, default 27; xpeng uses 20 - dark gradients band at 27), and
+  `GHOST_SCALE` (enlarge the ghost about its per-frame ground-contact point so feet
+  stay planted and the path stays aligned; chel-on-xpeng ships at 1.1). Videos archived
+  as `chel_{replay,overlay}_nvsoma.mp4` next to the G1 ones.
+- **NV outputs walk on air; ground them post-import** (`humanoid_motion_recon.ground_qpos`,
+  qpos csv + `ROBOT_XML` -> constant z-shift). Their scaler multiplies the BVH Hips
+  height by a calibration measured on the retargeter's own template; a source whose
+  standing pelvis sits higher rides the whole solve above the floor with feet rigid but
+  hovering (measured planted-sole float: G1-vera 4.6 cm, chel-vera 1.2 cm, both xpeng
+  runs 19-21 cm - the xpeng subject is a long-legged robot). Per-frame min-z of the
+  foot-collision-geom AABBs is the planted sole (walking always has a support foot);
+  subtract its median. Per-frame std ~2 cm, so a constant shift lands soles within
+  +/-2 cm of the subject's floor in overlays.
+- **Torso lean: a reference pose's own posture rides into every export.** Both NV
+  retargets stood pitched ~15-17 deg forward of the subject (vera: subject 8 deg,
+  NV-G1 25, NV-chel 20). Cause chain, isolated by computing the actual IK orientation
+  targets (q_soma x shipped q_offset) across BVH sources: (1) the exporter anchored
+  Hips/Chest anatomy to frame 0 of NVIDIA's `Neutral_walk_forward` sample, whose SOMA
+  Hips/Chest already carry pelvis ~7 / chest ~13 deg of forward pitch vs the zero pose
+  the joint_offsets are calibrated against - that sacral tilt added to every subject's
+  real lean (invisible to the round-trip harness: re-encoding their clip against their
+  own reference is self-consistent); fix = anchor TORSO frames to
+  `soma_zero_frame0.bvh` (limb rest anatomy stays on the walk reference - the
+  rig-exact limb frames are calibrated against it). (2) SAM's neck keypoint sits at
+  the throat, ~2.6 deg forward of the spine line - measured spine is now
+  shoulders-mid - mid-hip. (3) A 1:1 spine-mapped pelvis over-pitches: in their own
+  mocap the Hips pitches only ~1/3 of the spine line (pickup clip: spine 62 -> pelvis
+  21); the exporter now tilt-reduces the spine toward vertical for the PELVIS anchor
+  only (`MR_PELVIS_BEND_FRAC`, default 0.35; watch the axis - the exporter's working
+  frame is Y-up). (4) NVIDIA's shipped G1 Chest offset itself bakes +4.7 deg of hunch
+  vs the exactly-computed zero->stand value (single-axis delta, their demos hunch);
+  `drive_g1.py` runs stock config with only that quat replaced. After all four: stand
+  tilt subject 8.2 / NV-G1 14.0 / NV-chel 10.3 (was 24.9 / 20.5); xpeng 4.9 / 9.6 /
+  7.0. Diagnostic scripts: `outputs/chel/chel_nv/diag_lean.py` (per-source target
+  pitches), acceptance metric = FK shoulder-mid-vs-pelvis tilt vs the fit3d subject.
 
 ### 7.9 Mesh lifting + GPU rendering infrastructure
 

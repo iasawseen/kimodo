@@ -57,7 +57,8 @@ if SCENE == "kitchen":
     cam_lookat = meta["lookat"]; cam_az = meta["azimuth"]
     cam_el = meta["elevation"]; cam_dist = meta["distance"]; fovy = meta.get("fovy", 30.0)
 else:
-    XML = os.path.join(REPO, "kimodo/assets/skeletons/g1skel34/xml/g1.xml")
+    XML = os.environ.get("ROBOT_XML",
+                         os.path.join(REPO, "kimodo/assets/skeletons/g1skel34/xml/g1.xml"))
     lz = np.load(os.path.join(OUTD, "lift3d.npz"))
     view = lz["R_cam2world"] @ np.array([0.0, 0.0, 1.0]); view /= np.linalg.norm(view)
     fovy = float(np.degrees(lz["fov_h"])) if "fov_h" in lz.files else 30.0
@@ -76,7 +77,7 @@ else:
         pad = np.pad(qpos[:, :3], ((k // 2, k // 2), (0, 0)), mode="edge")
         cam_lookat = np.stack([np.convolve(pad[:, c], np.ones(k) / k, "valid")
                                for c in range(3)], 1)
-        cam_lookat[:, 2] = 0.7                           # frame the whole body
+        cam_lookat[:, 2] = float(os.environ.get("LOOKAT_Z", "0.7"))  # frame the whole body
 
 m = mujoco.MjModel.from_xml_path(XML)
 m.vis.global_.offwidth, m.vis.global_.offheight = PW, PH
