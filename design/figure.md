@@ -30,6 +30,7 @@ doc; §7 here keeps the Figure-scenario findings.
 | `figure/gen_gestures.py` | gesture prompt probe (which gestures work under a station pin) |
 | `humanoid_motion_recon.pose_video`, `figure/pose_retarget.py` | SAM-3D-Body runner (per-frame MHR: keypoints + mesh + rotations, §7.1) + direction-transfer anchor retarget (§7.1) |
 | `figure/soma_retarget.py`, `figure/render_replay.py` | SOMA-style retarget fit3d → G1 qpos (direction transfer + MuJoCo DLS IK) + vertical video/MuJoCo replay renderer, plain or kitchen scene (§7.8) |
+| `figure/render_overlay.py` | ghost overlay: G1 mesh (MuJoCo FK from `g1_replay.csv`, world ÷ SOMA_SCALE back into the subject's world) splatted through the calibrated body_fix camera chain onto the source frames, semi-transparent orange (example.png style); FRAMES env = processed-frame dir |
 | `humanoid_motion_recon.sam3d_dummy_video`, `humanoid_motion_recon.sam3d_mesh_video` | chirality evidence: raw SAM 3D skeleton / 3D mesh renders (mesh cache-first from saved `verts`; §7.1) |
 | `humanoid_motion_recon.gpurender` | shared torch-CUDA raster utils (splat/lines/cloud/resize/colormap) used by all video renderers (§7.9) |
 | `humanoid_motion_recon.lift_mesh`, `humanoid_motion_recon.mesh_world_video` | world-lift + temporal smoothing of the SAM meshes (fit_pose transform chain per vertex) + two-pane render (§7.9) |
