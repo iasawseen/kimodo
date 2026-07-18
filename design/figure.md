@@ -632,10 +632,35 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   is only 480x540, so its overlays render at 2x with the ghost rasterized sharp),
   `CQ` (NVENC quality, default 27; xpeng uses 20 - dark gradients band at 27), and
   `GHOST_SCALE` (enlarge the ghost about its per-frame ground-contact point so feet
-  stay planted and the path stays aligned; chel-on-xpeng ships at 1.1). Videos archived
-  as `chel_{replay,overlay}_nvsoma.mp4` next to the G1 ones.
+  stay planted and the path stays aligned; chel-on-xpeng ships at 1.1). `VIEW2=1` adds
+  the collate-style second pane (dense per-frame VGGT cloud when `DEPTH_WORK` is set);
+  `V2_STACK` picks the layout — `v` (default) renders the pane at full frame width and
+  stacks it BELOW, `h` beside at full frame height. Convention: figure ships vertical,
+  vera/xpeng horizontal. `MAX_FRAMES` caps the render for scale/config test clips.
+  GHOST HEIGHT vs a ROBOT subject: the hips-scale match equates chel to the subject at
+  the HIPS, but chel's above-hip proportion is taller — over the Figure robot (fit-world
+  nose-heel 1.545 m vs chel ghost 1.86 m) it reads 17-20% tall; measured head-level is
+  GHOST_SCALE 0.88, figure ships 0.90. Videos archived
+  as `chel_{replay,overlay}_nvsoma.mp4` + `chel_overlay_2view.mp4` next to the G1 ones.
+- **Chel forward bend is hip-rail-limited — morphology, not a retarget bug.** Chel has
+  NO waist pitch (pelvis-to-torso is `torso_yaw` only), so torso pitch = pelvis pitch.
+  In figure's deep dishwasher bend the source torso hits 60 deg while chel's pelvis
+  carries ~20 and BOTH hip_pitch sit exactly AT the real −77 deg rail (knees 62-75 of
+  115, ankles −27 of −70 — the legs are not the binder). Raising the exporter's pelvis
+  fraction (`MR_PELVIS_BEND_FRAC` 0.35 -> 0.7) lifts the pelvis TARGET to 31-42 deg but
+  the IK cashes only ~3 deg: with the hip clamped, every degree of pelvis pitch must be
+  absorbed by the leg chain against the Shin orientation targets. Ships per-scenario:
+  figure + vera at 0.7 (vera's crouch deepens 36 -> 46 deg while the walking median
+  stays 8 -> 10 — the torso-lean fix holds), xpeng at 0.35. Feasibility of the 0.7
+  output vs the FULL-geometry chel.xml: every joint margin >= 0 (hips at the rail,
+  never past), CoM inside the true foot support polygon 89% of bend frames (max
+  excursion 3.9 cm, better than 0.35's 6.4 — the butt-back pelvis pitch is its own
+  counterweight), static hip-pitch load ~25 N·m vs the 380 N·m rating. The one
+  UNCHECKED axis is self-collision (config runs collision_weight 0 on a geometry-free
+  skeleton): the left hand grazes hip/knee up to 27 mm on ~13 of 4970 frames.
 - **NV outputs walk on air; ground them post-import** (`humanoid_motion_recon.ground_qpos`,
-  qpos csv + `ROBOT_XML` -> constant z-shift). Their scaler multiplies the BVH Hips
+  qpos csv + `ROBOT_XML` -> constant z-shift; chel: pass the FULL-geometry chel.xml —
+  the collapsed NV skeleton has no collision geoms, so no foot AABBs to ground on). Their scaler multiplies the BVH Hips
   height by a calibration measured on the retargeter's own template; a source whose
   standing pelvis sits higher rides the whole solve above the floor with feet rigid but
   hovering (measured planted-sole float: G1-vera 4.6 cm, chel-vera 1.2 cm, both xpeng

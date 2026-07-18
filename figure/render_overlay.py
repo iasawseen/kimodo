@@ -56,10 +56,13 @@ GHOST_SCALE = float(os.environ.get("GHOST_SCALE", "1"))
 # per-frame cloud exactly like pose_over_cloud (conf-gated backprojection, +33 deg orbit
 # about the median scene depth, painter's splat) with the ghost mesh in the same tilted
 # camera; without DEPTH_WORK it falls back to the sparse lift3d scene cloud.
+# V2_STACK picks the layout: "v" (default) stacks the pane below at full frame width,
+# "h" places it beside the frame at full frame height.
 VIEW2 = os.environ.get("VIEW2", "0") != "0"
 V2_TILT = np.radians(float(os.environ.get("VIEW2_TILT", "33")))
 DEPTH_WORK = os.environ.get("DEPTH_WORK", "")
 V2_CONF = float(os.environ.get("V2_CONF", "1.2"))
+V2_STACK = os.environ.get("V2_STACK", "v")                  # "v": pane below; "h": beside
 ROBOT_XML = os.environ.get("ROBOT_XML",
                            os.path.join(REPO, "kimodo/assets/skeletons/g1skel34/xml/g1.xml"))
 STAND_Z = float(os.environ.get("ROBOT_STAND_Z", "0.72"))    # robot root height at stand
@@ -114,6 +117,8 @@ frame_files = sorted(f for f in os.listdir(FRAMES) if f.endswith(".jpg"))
 T0 = float(os.environ.get("T0", "0"))                       # qpos row 0 <-> video t=T0
 OFF = int(round(T0 * FPS))
 T = min(OFF + len(qpos), len(frame_files), N)
+if os.environ.get("MAX_FRAMES"):
+    T = min(T, int(os.environ["MAX_FRAMES"]))
 FW, FH = Image.open(os.path.join(FRAMES, frame_files[0])).size
 FW0, FH0, F_SAM0 = FW, FH, F_SAM                            # original processed-frame px
 if UPSCALE != 1.0:                                          # everything scales together:
@@ -156,12 +161,16 @@ def assemble(n):
 F_T, FIDX, BARY = gr.sample_mesh(faces, assemble(0), density=DENSITY)
 Kt = (f_frame, f_frame, FW / 2.0, FH / 2.0)
 
-PW2 = FW
+PW2, PH2 = FW, FH
 if VIEW2 and DEPTH_WORK:                                    # dense colored per-frame cloud
     _d0 = np.load(os.path.join(DEPTH_WORK, "depth", "f00000.npz"))
     D_H, D_W = _d0["depth"].shape
-    SC2 = FH / D_H
-    PW2 = 2 * round(D_W * SC2 / 2)
+    if V2_STACK == "v":                                     # full-width pane, own height
+        SC2 = FW / D_W
+        PH2 = 2 * round(D_H * SC2 / 2)
+    else:
+        SC2 = FH / D_H
+        PW2 = 2 * round(D_W * SC2 / 2)
     _vs2, _us2 = torch.meshgrid(
         torch.arange(D_H, dtype=torch.float32, device=gr.DEV),
         torch.arange(D_W, dtype=torch.float32, device=gr.DEV), indexing="ij")
@@ -201,8 +210,8 @@ def pane2_dense(n, vw, pelv, frame):
     Yt = _CA2 * Y - _SA2 * (Dg - zmid)
     Zt = (_SA2 * Y + _CA2 * (Dg - zmid) + zmid).clamp(min=1e-4)
     u = (PW2 / 2 + X / Zt * fx * SC2).clamp(0, PW2 - 2)
-    v = (FH / 2 + Yt / Zt * fy * SC2).clamp(0, FH - 2)
-    cv2_ = gr.canvas(FH, PW2)
+    v = (PH2 / 2 + Yt / Zt * fy * SC2).clamp(0, PH2 - 2)
+    cv2_ = gr.canvas(PH2, PW2)
     gr.splat_cloud(cv2_, torch.stack([u, v], 1), Zt, src[good], SQ2)
     if vw is not None:
         vc = (vw - c_c2w[n]) @ Minv[n].T
@@ -212,7 +221,7 @@ def pane2_dense(n, vw, pelv, frame):
         gv = np.stack([vc[:, 0], _CA2 * vc[:, 1] - _SA2 * Zr,
                        _SA2 * vc[:, 1] + _CA2 * Zr + zmid], 1)
         gr.mesh_splat(cv2_, torch.as_tensor(gv, dtype=torch.float32, device=gr.DEV),
-                      F_T, FIDX, BARY, (fx * SC2, fy * SC2, PW2 / 2.0, FH / 2.0),
+                      F_T, FIDX, BARY, (fx * SC2, fy * SC2, PW2 / 2.0, PH2 / 2.0),
                       base_color=COLOR)
     return gr.to_np(cv2_)
 
@@ -247,7 +256,10 @@ def pane2(n, vw, pelv, frame):
     return gr.to_np(cv2_)
 
 
-wr = VideoWriter(OUTP, FW + (PW2 if VIEW2 else 0), FH, FPS, cq=CQ)
+if VIEW2 and V2_STACK == "v":
+    wr = VideoWriter(OUTP, FW, FH + PH2, FPS, cq=CQ)
+else:
+    wr = VideoWriter(OUTP, FW + (PW2 if VIEW2 else 0), FH, FPS, cq=CQ)
 print(f"[overlay] {T} frames, F_SC {F_SC:.4f}, body_fix {s_fix:.3f}, "
       f"f {f_frame:.1f}px, V {Vtot}, alpha {ALPHA}, view2 {VIEW2}")
 for n in range(T):
@@ -279,7 +291,8 @@ for n in range(T):
         out = frame
     main = gr.to_np(out)
     if VIEW2:
-        main = np.concatenate([main, pane2(n, vw, pelv, frame)], 1)
+        main = np.concatenate([main, pane2(n, vw, pelv, frame)],
+                              0 if V2_STACK == "v" else 1)
     wr.write(main)
     if n % 100 == 0:
         print(f"[overlay] {n}/{T}")
