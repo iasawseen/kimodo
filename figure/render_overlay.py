@@ -189,7 +189,13 @@ def pane2_dense(n, vw, pelv, frame):
     src = gr.resize(frame, D_H, D_W)
     good = C > V2_CONF
     Dg = D[good]
-    zmid = float(torch.quantile(Dg, 0.5)) if Dg.numel() else 1.0
+    # pivot the orbit on the SUBJECT's depth when known: in dark scenes the confident
+    # points are all far (ceiling lights) and a scene-median pivot swings the near-field
+    # robot out of frame
+    if pelv is not None:
+        zmid = float(pelv[2])
+    else:
+        zmid = float(torch.quantile(Dg, 0.5)) if Dg.numel() else 1.0
     X = (_us2[good] - D_W / 2) / fx * Dg
     Y = (_vs2[good] - D_H / 2) / fy * Dg
     Yt = _CA2 * Y - _SA2 * (Dg - zmid)

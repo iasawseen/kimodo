@@ -608,9 +608,15 @@ Stage 1 of the gait.md pipeline, from the video reconstruction instead of Kimodo
   frame's posture-varying twist directly commands the forearm roll and the IK winds
   shoulder_yaw vs elbow_yaw +/-60-90 deg against each other (palms-back scarecrow
   hands; worst on straight-arm subjects); no offset recalibration, init pose, weight,
-  mask or joint-limit change can fix a structurally misplaced target. Arm joint_scales
-  must be SEGMENT-LENGTH ratios (chel/soma chain = 0.954), never radial-at-pose values
-  from a calibration posture. Renderers are now
+  mask or joint-limit change can fix a structurally misplaced target. Arm joint_scales:
+  calibrate per-joint radial ratios at the HANGING stand pair (walk-f0 vs robot stand:
+  Arm 1.454 / ForeArm 1.177 / Hand 0.872 for chel — radial-from-root conflates
+  shoulder height/width with arm length, so a single segment ratio misplaces every arm
+  point). ABDUCTION TRAP: their IKSmoothJointFilter is a near-limit mid-range
+  regularizer — on a joint with an ASYMMETRIC range (chel shoulder_roll [-10,145],
+  arms-at-body sits near the adduction limit) the G1-copied mask 1.0 pushes the arms
+  ~8-10 deg outward of the source; mask 0.15 restores source abduction (source 9.7 ->
+  solved ~6 vs 17-20 before). Renderers are now
   robot-generic (`ROBOT_XML`, replay `LOOKAT_Z`); for NV-soma trajectories the overlay
   scale must be the chain-consistent `SOMA_HIPS_SCALE` (effective NV Hips scale:
   G1 0.7744, Chel 0.883 -> F_SC = 0.918 template-midhip x hips-scale / plateau). The
